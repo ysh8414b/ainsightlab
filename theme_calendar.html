@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Google Analytics (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-3G7NQ8B69G"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-3G7NQ8B69G');
+  </script>
+  <title>테마 캘린더 — STOCKPULSE</title>
+  <meta name="description" content="STOCKPULSE 테마 캘린더. 매일 인기 테마 TOP 3를 캘린더에서 한눈에 확인하세요." />
+  <meta property="og:title" content="테마 캘린더 — STOCKPULSE" />
+  <meta property="og:description" content="매일 인기 테마 TOP 3를 캘린더에서 한눈에 확인하세요." />
+  <link rel="canonical" href="https://ainsightlab.kr/theme_calendar.html" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="STOCKPULSE" />
+  <meta property="og:url" content="https://ainsightlab.kr/theme_calendar.html" />
+  <meta property="og:locale" content="ko_KR" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="keywords" content="테마 캘린더, 인기 테마주, 일별 테마, 테마 히스토리, 주도 테마, 시장 테마" />
+  <meta name="robots" content="noindex, nofollow" />
+  <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="shared.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useMemo}=React;
+
+function Box({children,style,hover=true,className=""}){
+  const[h,setH]=useState(false);
+  return <div className={className} style={{background:h&&hover?"var(--card-hbg)":"var(--card-bg)",border:"1px solid",borderColor:h&&hover?"var(--card-hbd)":"var(--card-bd)",borderRadius:"12px",padding:"18px 22px",transition:"all .25s",...style}} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)}>{children}</div>;
+}
+
+function Loader(){return <div style={{display:"flex",justifyContent:"center",padding:"60px 0"}}><div style={{width:28,height:28,border:"3px solid var(--div3)",borderTop:"3px solid #f97316",borderRadius:"50%",animation:"spin 1s linear infinite"}}/></div>}
+
+const trendClr=t=>t==="up"?"#22c55e":t==="down"?"#ef4444":"#6b7280";
+const trendBg=t=>t==="up"?"rgba(34,197,94,0.12)":t==="down"?"rgba(239,68,68,0.12)":"rgba(107,114,128,0.12)";
+const trendArrow=t=>t==="up"?"▲":t==="down"?"▼":"—";
+const rankClr=r=>r===1?"#f59e0b":r===2?"#94a3b8":r===3?"#cd7f32":"var(--muted)";
+const rankBg=r=>r===1?"rgba(245,158,11,0.14)":r===2?"rgba(148,163,184,0.12)":r===3?"rgba(205,127,50,0.12)":"var(--badge-bg)";
+const formatValue=v=>{if(!v||v===0)return"-";const e=v/1e8;if(e>=10000)return(e/10000).toFixed(1)+"조";if(e>=1)return Math.round(e).toLocaleString()+"억";return v.toLocaleString()};
+
+function ThemeStockPanel({themeName,onClose}){
+  const[stocks,setStocks]=useState([]);
+  const[themeInfo,setThemeInfo]=useState(null);
+  const[loading,setLoading]=useState(true);
+  const[sort,setSort]=useState("rank");
+  const[visible,setVisible]=useState(false);
+  const isMob=window.innerWidth<=600;
+
+  useEffect(()=>{
+    if(!themeName)return;
+    setLoading(true);
+    requestAnimationFrame(()=>setVisible(true));
+    Promise.all([
+      db("theme_stocks_all",`theme_name=eq.${encodeURIComponent(themeName)}&order=rank`),
+      db("all_themes",`name=eq.${encodeURIComponent(themeName)}&limit=1`)
+    ]).then(([s,t])=>{
+      if(s?.length)setStocks(s);
+      if(t?.length)setThemeInfo(t[0]);
+      setLoading(false);
+    });
+  },[themeName]);
+
+  const close=()=>{setVisible(false);setTimeout(onClose,300)};
+
+  const sorted=useMemo(()=>{
+    const arr=[...stocks];
+    if(sort==="change")arr.sort((a,b)=>parseFloat(b.change_pct)-parseFloat(a.change_pct));
+    else if(sort==="volume")arr.sort((a,b)=>(b.trading_value||0)-(a.trading_value||0));
+    else arr.sort((a,b)=>a.rank-b.rank);
+    return arr;
+  },[stocks,sort]);
+
+  const upC=stocks.filter(s=>s.trend==="up").length;
+  const dnC=stocks.filter(s=>s.trend==="down").length;
+
+  return <div>
+    {/* 오버레이 */}
+    <div onClick={close} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:998,opacity:visible?1:0,transition:"opacity .3s"}}/>
+    {/* 패널 */}
+    <div style={{position:"fixed",top:0,right:0,bottom:0,width:isMob?"100%":"480px",maxWidth:"100vw",background:"var(--bg)",borderLeft:"1px solid var(--card-bd)",zIndex:999,transform:visible?"translateX(0)":"translateX(100%)",transition:"transform .3s ease",display:"flex",flexDirection:"column",boxShadow:"-4px 0 20px rgba(0,0,0,0.3)"}}>
+      {/* 헤더 */}
+      <div style={{padding:"20px 24px 16px",borderBottom:"1px solid var(--div2)",flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+            <h2 style={{fontSize:"20px",fontWeight:800,margin:0}}>{themeName}</h2>
+            {themeInfo&&<span style={{padding:"3px 10px",borderRadius:"16px",fontSize:"13px",fontWeight:600,background:"rgba(245,158,11,0.12)",color:"#f59e0b"}}>{stocks.length}종목</span>}
+          </div>
+          <button onClick={close} style={{width:32,height:32,borderRadius:"8px",border:"1px solid var(--card-bd)",background:"var(--card-bg)",cursor:"pointer",fontSize:"18px",color:"var(--muted)",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+        {themeInfo&&<div style={{display:"flex",alignItems:"center",gap:"16px",flexWrap:"wrap"}}>
+          <span style={{fontSize:"18px",fontWeight:700,color:trendClr(themeInfo.trend)}}>{trendArrow(themeInfo.trend)} {themeInfo.change_pct}</span>
+          <span style={{fontSize:"13px",color:"var(--muted)"}}>
+            <span style={{color:"#22c55e"}}>▲{upC}</span> · <span style={{color:"#6b7280"}}>{stocks.length-upC-dnC}</span> · <span style={{color:"#ef4444"}}>▼{dnC}</span>
+          </span>
+        </div>}
+        <div style={{display:"flex",gap:"5px",marginTop:"12px"}}>
+          {[{id:"rank",l:"복합점수"},{id:"change",l:"등락률"},{id:"volume",l:"거래대금"}].map(x=>
+            <button key={x.id} onClick={()=>setSort(x.id)} style={{padding:"5px 12px",fontFamily:"inherit",fontSize:"13px",fontWeight:500,background:sort===x.id?"var(--tab-bg)":"var(--hover)",border:"1px solid",cursor:"pointer",borderColor:sort===x.id?"var(--tab-bd)":"transparent",borderRadius:"7px",color:sort===x.id?"#f59e0b":"var(--muted)",transition:"all .2s"}}>{x.l}</button>
+          )}
+        </div>
+      </div>
+      {/* 종목 리스트 */}
+      <div style={{flex:1,overflowY:"auto"}}>
+        {/* 컬럼 헤더 */}
+        <div style={{display:"grid",gridTemplateColumns:isMob?"28px 1fr 72px":"36px 1fr 90px 80px 80px",padding:isMob?"8px 12px":"10px 16px",borderBottom:"1px solid var(--div2)",fontSize:"12px",fontWeight:600,color:"var(--muted)",gap:isMob?"4px":"6px",position:"sticky",top:0,background:"var(--bg)",zIndex:1}}>
+          <span>#</span><span>종목명</span>{!isMob&&<span style={{textAlign:"right"}}>현재가</span>}<span style={{textAlign:"right"}}>등락률</span>{!isMob&&<span style={{textAlign:"right"}}>거래대금</span>}
+        </div>
+        {loading?<Loader/>:sorted.length===0?<div style={{padding:"40px",textAlign:"center",color:"var(--muted)"}}>종목 데이터가 없습니다</div>
+          :sorted.map((s,i)=>{
+            const clr=s.trend==="up"?"#22c55e":(s.trend==="down"?"#ef4444":"#6b7280");
+            const arrow=s.trend==="up"?"▲":(s.trend==="down"?"▼":"─");
+            return <a key={s.code} href={`https://stock.naver.com/domestic/stock/${s.code}/total`} target="_blank" rel="noopener noreferrer"
+              style={{display:"grid",gridTemplateColumns:isMob?"28px 1fr 72px":"36px 1fr 90px 80px 80px",alignItems:"center",padding:isMob?"9px 12px":"10px 16px",borderBottom:"1px solid var(--div)",textDecoration:"none",color:"inherit",cursor:"pointer",transition:"background .15s",gap:isMob?"4px":"6px"}}
+              onMouseEnter={e=>e.currentTarget.style.background="rgba(245,158,11,0.06)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              <span style={{width:isMob?24:28,height:isMob?24:28,borderRadius:"6px",fontSize:isMob?"11px":"12px",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",background:i<3?"rgba(245,158,11,0.12)":"var(--badge-bg)",color:i<3?"#f59e0b":"var(--muted)"}}>{i+1}</span>
+              <div style={{minWidth:0}}>
+                <div style={{fontWeight:600,fontSize:isMob?"13px":"14px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}<span style={{color:"var(--dim)",fontSize:"11px",marginLeft:"4px"}}>{s.code}</span></div>
+                {isMob&&<div style={{fontSize:"11px",color:"var(--muted)",marginTop:"1px"}}>{s.price?`₩${Number(s.price).toLocaleString()}`:"-"} · {formatValue(s.trading_value)}</div>}
+              </div>
+              {!isMob&&<div style={{textAlign:"right",fontWeight:600,fontSize:"14px",fontVariantNumeric:"tabular-nums"}}>{s.price?`₩${Number(s.price).toLocaleString()}`:"-"}</div>}
+              <div style={{textAlign:"right",fontWeight:700,fontSize:isMob?"12px":"13px",color:clr}}>{arrow} {s.change_pct}</div>
+              {!isMob&&<div style={{textAlign:"right",fontSize:"12px",color:"var(--muted)",fontVariantNumeric:"tabular-nums"}}>{formatValue(s.trading_value)}</div>}
+            </a>;
+          })}
+      </div>
+    </div>
+  </div>;
+}
+
+function ThemeCalendar({year,month,data,selectedDate,onSelect}){
+  const daysInMonth=new Date(year,month+1,0).getDate();
+  const days=["월","화","수","목","금"];
+
+  // 주차별로 평일만 모은 2차원 배열 생성
+  const weeks=useMemo(()=>{
+    const w=[];let cur=[];
+    for(let d=1;d<=daysInMonth;d++){
+      const dow=new Date(year,month,d).getDay();
+      if(dow===0||dow===6)continue; // 토,일 스킵
+      // 월요일이면 새 주 시작
+      if(dow===1&&cur.length>0){w.push(cur);cur=[];}
+      // 첫 주에서 월요일 전 빈칸 채우기
+      if(cur.length===0&&dow>1){for(let p=1;p<dow;p++)cur.push(null);}
+      cur.push(d);
+    }
+    if(cur.length>0){while(cur.length<5)cur.push(null);w.push(cur);}
+    return w;
+  },[year,month]);
+
+  const dataByDate=useMemo(()=>{
+    const m={};
+    if(data)data.forEach(r=>{
+      const d=r.date;
+      if(!m[d])m[d]=[];
+      m[d].push(r);
+    });
+    return m;
+  },[data]);
+
+  const pad=n=>n<10?"0"+n:""+n;
+
+  return <div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:"2px",marginBottom:"4px"}}>
+      {days.map(d=><div key={d} style={{textAlign:"center",fontSize:"14px",color:"var(--muted)",padding:"8px 0",fontWeight:600}}>{d}</div>)}
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:"2px"}}>
+      {weeks.flat().map((d,i)=>{
+        if(d===null)return <div key={i}/>;
+        const dateStr=`${year}-${pad(month+1)}-${pad(d)}`;
+        const dayThemesRaw=dataByDate[dateStr];
+        const isHoliday=dayThemesRaw&&dayThemesRaw.some(t=>t.name==="__HOLIDAY__");
+        const dayThemes=dayThemesRaw?dayThemesRaw.filter(t=>t.name!=="__HOLIDAY__"):null;
+        const hasThemes=dayThemes&&dayThemes.length>0;
+        const hasData=hasThemes||isHoliday;
+        const clickable=hasThemes;
+        const isSelected=selectedDate===dateStr;
+        const isToday=dateStr===new Date().toISOString().slice(0,10);
+
+        return <div key={i} className="theme-cal-day" onClick={()=>clickable&&onSelect(dateStr)} style={{
+          cursor:clickable?"pointer":"default",
+          background:isSelected?"rgba(249,115,22,0.1)":isToday?"rgba(255,255,255,0.03)":"transparent",
+          border:isSelected?"1px solid rgba(249,115,22,0.3)":isToday?"1px solid var(--div3)":"1px solid transparent",
+          opacity:hasData?1:0.35,minHeight:"78px"
+        }} onMouseEnter={e=>{if(clickable&&!isSelected)e.currentTarget.style.background="rgba(249,115,22,0.05)"}} onMouseLeave={e=>{if(!isSelected)e.currentTarget.style.background=isToday?"rgba(255,255,255,0.03)":"transparent"}}>
+          <div style={{fontSize:"15px",fontWeight:isToday?700:isSelected?600:400,color:"var(--text)",marginBottom:"4px"}}>{d}</div>
+          {isHoliday?
+            <div className="theme-cal-badge" title="시장 휴장일" style={{background:"rgba(107,114,128,0.15)",color:"#9ca3af",fontWeight:600}}>🏖️ 휴장</div>
+            :dayThemes&&dayThemes.slice(0,3).map((t,ti)=><div key={ti} className="theme-cal-badge" title={t.name} style={{
+              background:trendBg(t.trend),color:trendClr(t.trend)
+            }}>{t.name}</div>)
+          }
+        </div>;
+      })}
+    </div>
+  </div>;
+}
+
+function ThemeDayDetail({themes,date,onThemeClick}){
+  const isHoliday=themes&&themes.some(t=>t.name==="__HOLIDAY__");
+  const realThemes=themes?themes.filter(t=>t.name!=="__HOLIDAY__"):[];
+  if(isHoliday&&realThemes.length===0)return <Box hover={false} style={{padding:"40px",textAlign:"center"}}>
+    <div style={{fontSize:"36px",marginBottom:"12px",opacity:0.5}}>🏖️</div>
+    <div style={{fontWeight:600,color:"var(--muted)",marginBottom:"4px"}}>{date}</div>
+    <div style={{fontSize:"14px",color:"var(--dim)"}}>한국 시장 휴장일입니다</div>
+  </Box>;
+  if(realThemes.length===0)return <Box hover={false} style={{padding:"40px",textAlign:"center"}}>
+    <div style={{fontSize:"36px",marginBottom:"12px",opacity:0.4}}>🔥</div>
+    <div style={{fontWeight:600,color:"var(--muted)"}}>이 날짜의 테마 데이터가 없습니다</div>
+  </Box>;
+
+  return <div style={{display:"grid",gap:"10px"}}>
+    <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"4px"}}>
+      <span style={{width:36,height:36,borderRadius:"10px",background:"rgba(249,115,22,0.12)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"20px"}}>🔥</span>
+      <div><div style={{fontWeight:700,fontSize:"17px"}}>{date} 인기 테마</div><div style={{color:"var(--muted)",fontSize:"13px",marginTop:"2px"}}>TOP {realThemes.length} 테마</div></div>
+    </div>
+    {realThemes.map((t,i)=>{
+      const pctNum=parseFloat(t.change_pct);
+      const pctClr=pctNum>0?"#22c55e":pctNum<0?"#ef4444":"#6b7280";
+      const stocks=t.leading_stocks?t.leading_stocks.split(", ").slice(0,3):[];
+      return <Box key={i} hover={true} style={{padding:"16px 20px"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:"12px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"12px",flex:1,minWidth:0}}>
+            <span style={{width:34,height:34,borderRadius:"8px",fontSize:"16px",fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",background:rankBg(t.rank),color:rankClr(t.rank),flexShrink:0}}>{t.rank}</span>
+            <div style={{minWidth:0}}>
+              <span onClick={e=>{e.stopPropagation();onThemeClick(t.name)}} style={{fontWeight:700,fontSize:"17px",color:"var(--text)",cursor:"pointer",transition:"color .15s"}} onMouseEnter={e=>e.currentTarget.style.color="#f97316"} onMouseLeave={e=>e.currentTarget.style.color="var(--text)"}>{t.name}</span>
+              <div style={{display:"flex",alignItems:"center",gap:"8px",marginTop:"4px",fontSize:"13px",color:"var(--muted)"}}>
+                <span style={{color:"#22c55e"}}>▲{t.up_count||0}</span>
+                <span>·</span>
+                <span style={{color:"#6b7280"}}>{t.flat_count||0}</span>
+                <span>·</span>
+                <span style={{color:"#ef4444"}}>▼{t.down_count||0}</span>
+              </div>
+            </div>
+          </div>
+          <div style={{textAlign:"right",flexShrink:0}}>
+            <div style={{fontSize:"18px",fontWeight:700,color:pctClr}}>{trendArrow(t.trend)} {t.change_pct}</div>
+          </div>
+        </div>
+        {stocks.length>0&&<div style={{marginTop:"10px",paddingTop:"10px",borderTop:"1px solid var(--div)",display:"flex",flexWrap:"wrap",gap:"6px"}}>
+          {stocks.map((s,si)=>{
+            const parts=s.split(":");
+            const name=parts[0];const code=parts[1];const pct=parts[2]||"";
+            const sp=parseFloat(pct);const sc=sp>0?"#22c55e":sp<0?"#ef4444":"#6b7280";
+            const validCode=code&&/^\d{6}$/.test(code);
+            return <a key={si} href={validCode?`https://stock.naver.com/domestic/stock/${code}/total`:"#"} target="_blank" rel="noopener noreferrer" onClick={e=>{if(!validCode)e.preventDefault()}} style={{
+              padding:"5px 10px",background:"var(--badge-bg)",borderRadius:"6px",fontSize:"13px",textDecoration:"none",color:"var(--text)",transition:"all .15s",border:"1px solid transparent",display:"inline-flex",alignItems:"center",gap:"5px"
+            }} onMouseEnter={e=>{e.currentTarget.style.background="rgba(249,115,22,0.1)";e.currentTarget.style.borderColor="rgba(249,115,22,0.3)";e.currentTarget.style.color="#f97316"}} onMouseLeave={e=>{e.currentTarget.style.background="var(--badge-bg)";e.currentTarget.style.borderColor="transparent";e.currentTarget.style.color="var(--text)"}}>
+              {name}{pct&&<span style={{fontWeight:600,fontSize:"12px",color:sc}}>{pct}</span>}
+            </a>;
+          })}
+        </div>}
+      </Box>;
+    })}
+  </div>;
+}
+
+function App(){
+  const[theme,setTheme]=useState(getStoredTheme());
+  const[year,setYear]=useState(new Date().getFullYear());
+  const[month,setMonth]=useState(new Date().getMonth());
+  const[monthData,setMonthData]=useState(null);
+  const[selectedDate,setSelectedDate]=useState(null);
+  const[dayThemes,setDayThemes]=useState(null);
+  const[loading,setLoading]=useState(true);
+  const[panelTheme,setPanelTheme]=useState(null);
+
+  useEffect(()=>{document.body.className=theme==="light"?"light":"";setStoredTheme(theme)},[theme]);
+
+  const pad=n=>n<10?"0"+n:""+n;
+
+  // 월간 데이터 로드 (전체 TOP 10 — 캘린더 뱃지는 rank<=3만 표시, 카운트는 전체 사용)
+  useEffect(()=>{
+    setLoading(true);
+    const startDate=`${year}-${pad(month+1)}-01`;
+    const endDay=new Date(year,month+1,0).getDate();
+    const endDate=`${year}-${pad(month+1)}-${pad(endDay)}`;
+    db("theme_history",`select=date,rank,name,change_pct,trend,leading_stocks,up_count,down_count,flat_count&date=gte.${startDate}&date=lte.${endDate}&order=date,rank`).then(d=>{
+      // 주말/공휴일 데이터를 이전 평일(금요일)로 재매핑
+      const padD=n=>n<10?"0"+n:""+n;
+      const toWeekday=ds=>{
+        const dt=new Date(ds+"T12:00:00"); // 정오 기준으로 timezone 밀림 방지
+        const w=dt.getDay();
+        if(w===0)dt.setDate(dt.getDate()-2); // 일→금
+        else if(w===6)dt.setDate(dt.getDate()-1); // 토→금
+        return dt.getFullYear()+"-"+padD(dt.getMonth()+1)+"-"+padD(dt.getDate());
+      };
+      const mapped=(d||[]).map(r=>({...r,date:toWeekday(r.date)}));
+      // 같은 날짜에 중복 데이터 있으면 먼저 들어온 것만 유지
+      const seen=new Set();
+      const deduped=mapped.filter(r=>{const k=r.date+"|"+r.rank;if(seen.has(k))return false;seen.add(k);return true});
+      setMonthData(deduped);
+      setLoading(false);
+      // 자동 선택: 실제 테마 있는 날짜 우선 (휴장 마커 제외)
+      const realDates=[...new Set(deduped.filter(r=>r.name!=="__HOLIDAY__").map(r=>r.date))].sort();
+      if(realDates.length>0){
+        const now=new Date();const today=toWeekday(now.getFullYear()+"-"+padD(now.getMonth()+1)+"-"+padD(now.getDate()));
+        setSelectedDate(realDates.includes(today)?today:realDates[realDates.length-1]);
+      }else{
+        setSelectedDate(null);
+        setDayThemes(null);
+      }
+    });
+  },[year,month]);
+
+  // 선택된 날짜의 전체 TOP 10 로드 (월간 데이터에서 필터 — 날짜 재매핑 적용됨)
+  useEffect(()=>{
+    if(!selectedDate||!monthData){setDayThemes(null);return;}
+    const dayData=monthData.filter(r=>r.date===selectedDate).sort((a,b)=>a.rank-b.rank);
+    setDayThemes(dayData);
+  },[selectedDate,monthData]);
+
+  const prevMonth=()=>{if(month===0){setMonth(11);setYear(y=>y-1)}else setMonth(m=>m-1)};
+  const nextMonth=()=>{if(month===11){setMonth(0);setYear(y=>y+1)}else setMonth(m=>m+1)};
+  const isCurrentMonth=year===new Date().getFullYear()&&month===new Date().getMonth();
+
+  return <div>
+    <header className="page-header" style={{maxWidth:1440}}>
+      <a href="index.html" className="page-back">← 대시보드</a>
+      <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+        <a href="index.html" style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:"#22c55e",boxShadow:"0 0 10px rgba(34,197,94,0.4)"}}/>
+          <span style={{fontSize:"18px",fontWeight:800,letterSpacing:"-0.03em",background:"var(--h-grad)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>STOCKPULSE</span>
+        </a>
+        <button onClick={()=>setTheme(t=>t==="dark"?"light":"dark")} style={{width:34,height:34,borderRadius:"8px",border:"1px solid var(--card-bd)",background:"var(--card-bg)",cursor:"pointer",fontSize:"16px",display:"flex",alignItems:"center",justifyContent:"center",transition:"all .25s"}}>{theme==="dark"?"☀️":"🌙"}</button>
+      </div>
+    </header>
+
+    <main className="page-wrap" style={{maxWidth:1440,padding:"0 40px 60px"}}>
+      <div className="fade-up" style={{marginBottom:"32px"}}>
+        <h1 style={{fontSize:"24px",fontWeight:800,marginBottom:"6px"}}><span style={{color:"#f97316"}}>🔥</span> 테마 캘린더</h1>
+        <p style={{color:"var(--muted)",fontSize:"15px"}}>매일 인기 테마 TOP 3를 캘린더에서 한눈에 확인하세요. 최대 1년간 보관됩니다.</p>
+      </div>
+
+      <div className="archive-grid theme-cal-grid">
+        {/* 캘린더 패널 */}
+        <Box hover={false} className="sticky-cal" style={{padding:"20px",position:"sticky",top:"20px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"16px"}}>
+            <button onClick={prevMonth} style={{width:32,height:32,borderRadius:"8px",border:"1px solid var(--card-bd)",background:"var(--card-bg)",cursor:"pointer",color:"var(--text)",fontSize:"16px",display:"flex",alignItems:"center",justifyContent:"center",transition:"all .2s"}}>←</button>
+            <span style={{fontWeight:700,fontSize:"16px"}}>{year}년 {month+1}월</span>
+            <button onClick={nextMonth} disabled={isCurrentMonth} style={{width:32,height:32,borderRadius:"8px",border:"1px solid var(--card-bd)",background:"var(--card-bg)",cursor:isCurrentMonth?"not-allowed":"pointer",color:isCurrentMonth?"var(--dimmer)":"var(--text)",fontSize:"16px",display:"flex",alignItems:"center",justifyContent:"center",transition:"all .2s",opacity:isCurrentMonth?0.4:1}}>→</button>
+          </div>
+          {loading?<Loader/>:<ThemeCalendar year={year} month={month} data={monthData} selectedDate={selectedDate} onSelect={setSelectedDate}/>}
+          <div style={{marginTop:"14px",display:"flex",gap:"12px",justifyContent:"center",fontSize:"12px",color:"var(--muted)"}}>
+            <span style={{display:"flex",alignItems:"center",gap:"4px"}}><span style={{width:6,height:6,borderRadius:"50%",background:"#22c55e",display:"inline-block"}}/>상승</span>
+            <span style={{display:"flex",alignItems:"center",gap:"4px"}}><span style={{width:6,height:6,borderRadius:"50%",background:"#ef4444",display:"inline-block"}}/>하락</span>
+            <span style={{display:"flex",alignItems:"center",gap:"4px"}}><span style={{width:6,height:6,borderRadius:"50%",background:"#6b7280",display:"inline-block"}}/>보합</span>
+          </div>
+          {/* 월간 테마 등장 횟수 (캘린더 하단) */}
+          {monthData&&monthData.length>0&&(()=>{
+            const counts={};
+            monthData.filter(r=>r.name!=="__HOLIDAY__"&&r.rank>=1&&r.rank<=3).forEach(r=>{counts[r.name]=(counts[r.name]||0)+1});
+            const totalDays=[...new Set(monthData.filter(r=>r.name!=="__HOLIDAY__").map(r=>r.date))].length;
+            const sorted=Object.entries(counts).sort((a,b)=>b[1]-a[1]);
+            return <div style={{marginTop:"16px",paddingTop:"14px",borderTop:"1px solid var(--div)"}}>
+              <div style={{fontSize:"12px",fontWeight:600,color:"var(--muted)",marginBottom:"8px",display:"flex",justifyContent:"space-between"}}>
+                <span>📊 {month+1}월 등장 횟수</span>
+                <span style={{fontWeight:400,color:"var(--dim)"}}>{totalDays}일</span>
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:"4px"}}>
+                {sorted.slice(0,10).map(([name,cnt],i)=>
+                  <span key={name} style={{fontSize:"11px",padding:"3px 7px",borderRadius:"4px",background:i<3?"rgba(249,115,22,0.1)":"var(--badge-bg)",color:i<3?"#f97316":"var(--text-sub)",fontWeight:i<3?600:400,display:"inline-flex",alignItems:"center",gap:"3px"}}>
+                    {name}<span style={{fontWeight:700,color:i<3?"#f97316":"var(--muted)"}}>{cnt}</span>
+                  </span>
+                )}
+              </div>
+            </div>;
+          })()}
+        </Box>
+
+        {/* 상세 패널 */}
+        <div className="fade-up">
+          {selectedDate&&dayThemes?
+            <ThemeDayDetail themes={dayThemes} date={selectedDate} onThemeClick={setPanelTheme}/>
+          :<Box hover={false} style={{padding:"60px 40px",textAlign:"center"}}>
+            <div style={{fontSize:"48px",marginBottom:"16px",opacity:0.3}}>📅</div>
+            <div style={{fontWeight:600,fontSize:"17px",color:"var(--muted)",marginBottom:"6px"}}>날짜를 선택하세요</div>
+            <div style={{fontSize:"14px",color:"var(--dim)"}}>캘린더에서 날짜를 클릭하면 해당 날의 인기 테마를 볼 수 있습니다</div>
+          </Box>}
+        </div>
+      </div>
+    </main>
+
+    {panelTheme&&<ThemeStockPanel themeName={panelTheme} onClose={()=>setPanelTheme(null)}/>}
+
+    <footer className="theme-cal-footer" style={{borderTop:"1px solid var(--div2)",maxWidth:1440,margin:"0 auto",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:"8px",color:"var(--dimmer)",fontSize:"13px"}}>
+      <div><span style={{fontWeight:600,color:"var(--dim)"}}>STOCKPULSE</span> © 2026</div>
+      <div className="footer-links">
+        <a href="index.html">대시보드</a>
+        <a href="guide.html">투자 가이드</a>
+        <a href="about.html">서비스 소개</a>
+        <a href="privacy.html">개인정보처리방침</a>
+        <a href="terms.html">이용약관</a>
+      </div>
+    </footer>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

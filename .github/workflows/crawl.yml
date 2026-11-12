@@ -1,0 +1,124 @@
+name: STOCKPULSE 크롤링
+
+on:
+  schedule:
+    # 장중 5분 간격 (한국시간 09:00~15:30 = UTC 00:00~06:30)
+    - cron: '*/5 0-6 * * 1-5'
+    # 장 마감 후 최종 1회 (한국시간 16:00 = UTC 07:00)
+    - cron: '0 7 * * 1-5'
+
+  # 수동 실행 버튼
+  workflow_dispatch:
+    inputs:
+      force_catalyst:
+        description: '재료 포착 TOP 10을 지금 강제 산출 (시간대 무관, 당일 데이터 덮어씀)'
+        type: boolean
+        default: false
+      kakao_test:
+        description: '카카오톡 알림 테스트 메시지 보내기 (연결 확인용)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write   # 급등 AI 워크플로를 대신 실행하기 위해
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+      
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 패키지 설치
+        run: pip install requests
+
+      - name: 캐시 복원 (테마 매핑 DB + AI 테마 캐시 + 섹터 매핑)
+        uses: actions/cache@v4
+        with:
+          path: |
+            theme_stock_map.json
+            naver_theme_map.json
+            ai_themes_cache.json
+            sector_map.json
+            new_theme_cache.json
+          key: theme-cache-${{ hashFiles('crawl.py') }}-${{ github.run_id }}
+          restore-keys: |
+            theme-cache-${{ hashFiles('crawl.py') }}-
+            theme-cache-
+
+      - name: 크롤링 실행
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          FORCE_CATALYST: ${{ inputs.force_catalyst }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_TEST: ${{ inputs.kakao_test }}
+        run: python crawl.py
+
+      # GitHub 예약 실행(schedule)은 몇 시간씩 늦거나 빠지는 일이 많음 →
+      # 장 마감 후(평일 16:35~23:59 KST) 크롤링이 돌 때, 오늘 급등 AI 결과가 없고
+      # 실행 중인 것도 없으면 급등 AI 워크플로를 대신 실행
+      - name: 급등 AI 대신 실행 (예약 실행이 늦을 때)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          DOW=$(TZ=Asia/Seoul date +%u); HM=$(TZ=Asia/Seoul date +%H%M); TODAY=$(TZ=Asia/Seoul date +%F)
+          if [ "$DOW" -gt 5 ] || [ "$HM" -lt 1635 ]; then echo "급등 AI 시간 아님 ($DOW $HM)"; exit 0; fi
+          DONE=$(curl -s "$SUPABASE_URL/rest/v1/surge_model_runs?select=id&date=eq.$TODAY&limit=1" \
+            -H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY")
+          if [ "$DONE" != "[]" ]; then echo "오늘($TODAY) 급등 AI 이미 실행됨: $DONE"; exit 0; fi
+          API="https://api.github.com/repos/${{ github.repository }}/actions/workflows/surge.yml"
+          BUSY=0
+          for S in queued in_progress waiting pending requested; do
+            N=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "$API/runs?status=$S&per_page=1" | jq -r '.total_count // 0')
+            BUSY=$((BUSY + N))
+          done
+          if [ "$BUSY" -gt 0 ]; then echo "급등 AI 실행 중 — 건너뜀"; exit 0; fi
+          CODE=$(curl -s -o /tmp/out -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API/dispatches" -d '{"ref":"main"}')
+          echo "급등 AI 실행 요청: HTTP $CODE"; cat /tmp/out || true
+
+      # 내 매매 분석: 새로 입력한 매매(아직 분석 전)가 있거나, 평일 17:05 이후 오늘 분석이 없으면 실행
+      - name: 내 매매 분석 대신 실행
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          DOW=$(TZ=Asia/Seoul date +%u); HM=$(TZ=Asia/Seoul date +%H%M); TODAY=$(TZ=Asia/Seoul date +%F)
+          H=(-H "apikey: $SUPABASE_KEY" -H "Authorization: Bearer $SUPABASE_KEY")
+          NEW=$(curl -s "$SUPABASE_URL/rest/v1/mt_trades?select=id&status=eq.open&last_date=is.null&analyze_tries=lt.3&limit=1" "${H[@]}")
+          WHY=""
+          if [ "${NEW:0:2}" = "[{" ]; then WHY="새 매매 분석"; fi
+          if [ -z "$WHY" ] && [ "$DOW" -le 5 ] && [ "$HM" -ge 1705 ]; then
+            OPEN=$(curl -s "$SUPABASE_URL/rest/v1/mt_trades?select=id&status=eq.open&limit=1" "${H[@]}")
+            RUN=$(curl -s "$SUPABASE_URL/rest/v1/mt_runs?select=id&created_at=gte.${TODAY}T00:00:00%2B09:00&limit=1" "${H[@]}")
+            if [ "${OPEN:0:2}" = "[{" ] && [ "$RUN" = "[]" ]; then WHY="오늘 정기 분석"; fi
+          fi
+          if [ -z "$WHY" ]; then echo "내 매매 분석 필요 없음"; exit 0; fi
+          API="https://api.github.com/repos/${{ github.repository }}/actions/workflows/mytrades.yml"
+          BUSY=0
+          for S in queued in_progress waiting pending requested; do
+            N=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "$API/runs?status=$S&per_page=1" | jq -r '.total_count // 0')
+            BUSY=$((BUSY + N))
+          done
+          if [ "$BUSY" -gt 0 ]; then echo "내 매매 분석 실행 중 — 건너뜀"; exit 0; fi
+          CODE=$(curl -s -o /tmp/out2 -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API/dispatches" -d '{"ref":"main"}')
+          echo "내 매매 분석 실행 요청($WHY): HTTP $CODE"; cat /tmp/out2 || true

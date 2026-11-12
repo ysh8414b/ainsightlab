@@ -1,0 +1,5383 @@
+"""
+STOCKPULSE 크롤러
+KRX(한국거래소) API + Yahoo Finance + 네이버 검색 API + Groq AI로 주식 데이터를 수집하여 Supabase에 저장
+
+데이터 소스:
+  - KRX: 전종목 시세 (코드, 이름, 업종, 가격, 등락률, 거래량, 시가총액) — 메인 데이터
+  - Yahoo Finance: 시장 지수 + 스파크라인 차트 (코스피, 코스닥, 다우, 나스닥, S&P500, USD/KRW)
+  - 네이버 검색 API: 뉴스, 테마별 관련 뉴스
+  - 네이버 금융: 기업개요 (테마-종목 매핑 DB 구축)
+  - Groq AI (주 1회): 뉴스 기반 인기 테마 감지 / 평소: 규칙 기반 키워드 매칭
+
+사용법:
+  pip install requests
+
+  환경변수 설정:
+    SUPABASE_URL=https://xxxx.supabase.co
+    SUPABASE_KEY=your-service-role-key  (⚠️ service_role key 사용!)
+    NAVER_CLIENT_ID=네이버 검색 API 클라이언트 ID
+    NAVER_CLIENT_SECRET=네이버 검색 API 시크릿
+    GROQ_API_KEY=Groq AI API 키 (주 1회 테마 감지용)
+    DART_API_KEY=DART OpenAPI 인증키 (재료 포착 탭 — 공시 원출처 확인용, 선택)
+
+  python crawl.py
+"""
+
+import os
+import re
+import json
+import html
+import time
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+# ─────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://mmmpqmvwpuxqyxlxytsh.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # service_role key (GitHub Secrets에 저장)
+
+NAVER_CLIENT_ID = os.environ.get("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# Groq가 llama-3.3-70b-versatile을 2026-08-16에 종료 → 공식 대체 모델 (GROQ_MODEL 환경변수로 바꿀 수 있음)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "") or "openai/gpt-oss-120b"
+DART_API_KEY = os.environ.get("DART_API_KEY", "")  # https://opendart.fss.or.kr 무료 발급
+
+# 재료 포착 TOP 10을 close 모드가 아닐 때도 강제 산출 (수동 실행/테스트용)
+FORCE_CATALYST = os.environ.get("FORCE_CATALYST", "").strip().lower() in ("1", "true", "yes", "on")
+# 카카오톡 "나에게 보내기" 알림 (성과 추적 편입·매도). 키가 없으면 알림만 건너뜀
+KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY", "").strip()
+KAKAO_CLIENT_SECRET = os.environ.get("KAKAO_CLIENT_SECRET", "").strip()
+KAKAO_TEST = os.environ.get("KAKAO_TEST", "").strip().lower() in ("1", "true", "yes", "on")
+SITE_URL = os.environ.get("SITE_URL", "") or "https://ainsightlab.kr"
+
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
+
+TODAY = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+
+import sys as _sys
+if _sys.stdout.encoding and _sys.stdout.encoding.lower().replace("-","") != "utf8":
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ─────────────────────────────────────────
+# 섹터/테마 상수
+# ─────────────────────────────────────────
+SECTOR_ICONS = {
+    "반도체":    "⚡",
+    "2차전지":   "🔋",
+    "바이오":    "🧬",
+    "자동차":    "🚗",
+    "IT/플랫폼": "💻",
+    "금융":      "🏦",
+    "소비재":    "🛒",
+    "철강/소재": "⚙️",
+    "에너지":    "⛽",
+    "건설":      "🏗️",
+}
+
+# 네이버 업종 ID → 디스플레이 섹터 매핑
+# (네이버 금융 sise_group_detail.naver?type=upjong&no=XX)
+NAVER_SECTOR_MAP = {
+    # 반도체
+    278: "반도체",   # 반도체와반도체장비
+    269: "반도체",   # 디스플레이장비및부품
+    327: "반도체",   # 디스플레이패널
+    # 바이오
+    286: "바이오",   # 생물공학
+    261: "바이오",   # 제약
+    281: "바이오",   # 건강관리장비와용품
+    262: "바이오",   # 생명과학도구및서비스
+    288: "바이오",   # 건강관리기술
+    316: "바이오",   # 건강관리업체및서비스
+    # 자동차
+    273: "자동차",   # 자동차
+    270: "자동차",   # 자동차부품
+    # IT/플랫폼
+    267: "IT/플랫폼", # IT서비스
+    287: "IT/플랫폼", # 소프트웨어
+    293: "IT/플랫폼", # 컴퓨터와주변기기
+    300: "IT/플랫폼", # 양방향미디어와서비스
+    308: "IT/플랫폼", # 인터넷과카탈로그소매
+    263: "IT/플랫폼", # 게임엔터테인먼트
+    285: "IT/플랫폼", # 방송과엔터테인먼트
+    292: "IT/플랫폼", # 핸드셋
+    294: "IT/플랫폼", # 통신장비
+    336: "IT/플랫폼", # 다각화된통신서비스
+    333: "IT/플랫폼", # 무선통신서비스
+    310: "IT/플랫폼", # 광고
+    338: "IT/플랫폼", # 사무용전자제품
+    314: "IT/플랫폼", # 출판
+    # 금융
+    301: "금융",     # 은행
+    321: "금융",     # 증권
+    330: "금융",     # 생명보험
+    315: "금융",     # 손해보험
+    319: "금융",     # 기타금융
+    337: "금융",     # 카드
+    280: "금융",     # 부동산
+    277: "금융",     # 창업투자
+    # 소비재
+    266: "소비재",   # 화장품
+    268: "소비재",   # 식품
+    309: "소비재",   # 음료
+    275: "소비재",   # 담배
+    274: "소비재",   # 섬유,의류,신발,호화품
+    297: "소비재",   # 가정용품
+    298: "소비재",   # 가정용기기와용품
+    303: "소비재",   # 가구
+    302: "소비재",   # 식품과기본식료품소매
+    264: "소비재",   # 백화점과일반상점
+    328: "소비재",   # 전문소매
+    339: "소비재",   # 다각화된소비자서비스
+    317: "소비재",   # 호텔,레스토랑,레저
+    271: "소비재",   # 레저용장비와제품
+    332: "소비재",   # 문구류
+    # 철강/소재
+    272: "철강/소재", # 화학
+    304: "철강/소재", # 철강
+    322: "철강/소재", # 비철금속
+    318: "철강/소재", # 종이와목재
+    311: "철강/소재", # 포장재
+    289: "철강/소재", # 건축자재
+    320: "철강/소재", # 건축제품
+    # 에너지
+    313: "에너지",   # 석유와가스
+    312: "에너지",   # 가스유틸리티
+    325: "에너지",   # 전기유틸리티
+    295: "에너지",   # 에너지장비및서비스
+    # 건설
+    279: "건설",     # 건설
+    299: "건설",     # 기계
+    291: "건설",     # 조선
+    284: "건설",     # 우주항공과국방
+    283: "건설",     # 전기제품
+    306: "건설",     # 전기장비
+    307: "건설",     # 전자제품
+    282: "건설",     # 전자장비와기기
+    296: "건설",     # 운송인프라
+    329: "건설",     # 도로와철도운송
+    326: "건설",     # 항공화물운송과물류
+    305: "건설",     # 항공사
+    323: "건설",     # 해운사
+}
+
+# KRX 업종 → 디스플레이 섹터 매핑 (KRX fallback용)
+KRX_SECTOR_MAP = {
+    # KOSPI 업종
+    "전기전자":   "반도체",
+    "의약품":     "바이오",
+    "의료정밀":   "바이오",
+    "운수장비":   "자동차",
+    "서비스업":   "IT/플랫폼",
+    "통신업":     "IT/플랫폼",
+    "은행":       "금융",
+    "증권":       "금융",
+    "보험":       "금융",
+    "기타금융":   "금융",
+    "철강금속":   "철강/소재",
+    "비금속광물": "철강/소재",
+    "화학":       "철강/소재",
+    "종이목재":   "철강/소재",
+    "건설업":     "건설",
+    "기계":       "건설",
+    "음식료품":   "소비재",
+    "유통업":     "소비재",
+    "섬유의복":   "소비재",
+    "전기가스업": "에너지",
+    # KOSDAQ 업종
+    "IT S/W & SVC":        "IT/플랫폼",
+    "IT H/W":              "반도체",
+    "제조 - 전기전자":      "반도체",
+    "제조 - 화학":          "철강/소재",
+    "제조 - 의료/정밀기기": "바이오",
+    "제조 - 기계/장비":     "건설",
+    "제조 - 금속":          "철강/소재",
+    "제조 - 음식료/담배":   "소비재",
+    "유통":                 "소비재",
+    "오락/문화":            "IT/플랫폼",
+    "금융":                 "금융",
+}
+
+# 2차전지 종목 (KRX에 별도 업종이 없어 코드로 직접 지정)
+BATTERY_STOCK_CODES = {
+    "373220",  # LG에너지솔루션
+    "247540",  # 에코프로비엠
+    "086520",  # 에코프로
+    "003670",  # 포스코퓨처엠
+    "066570",  # LG전자
+    "051910",  # LG화학
+    "112610",  # 씨에스윈드
+    "298050",  # 엘앤에프
+    "006260",  # LS
+    "006400",  # 삼성SDI
+}
+
+# AI 종목명 별칭 (AI가 다른 이름으로 부를 수 있는 종목)
+STOCK_NAME_ALIASES = {
+    "현대차":              "현대자동차",
+    "POSCO홀딩스":         "포스코홀딩스",
+    "포스코케미칼":         "포스코퓨처엠",
+    "HL만도":              "만도",
+    "YG엔터":             "YG엔터테인먼트",
+    "JYP":                "JYP Ent.",
+    "JYP엔터테인먼트":     "JYP Ent.",
+    "JYP엔터":            "JYP Ent.",
+    "SK바이오팜":          "SK바이오팜",
+    "SK이노베이션":        "SK이노베이션",
+    "LG에너지":            "LG에너지솔루션",
+    "삼성바이오":          "삼성바이오로직스",
+    "한화에어로":          "한화에어로스페이스",
+    "HD현대중공":          "HD현대중공업",
+    "HD한국조선":          "HD한국조선해양",
+    "현대차증권":          "현대차증권",
+    "SM엔터":             "SM",
+    "SM엔터테인먼트":      "SM",
+    "에코프로BM":          "에코프로비엠",
+    "두산에너빌":          "두산에너빌리티",
+    "레인보우로보":         "레인보우로보틱스",
+    "두산로보":            "두산로보틱스",
+    "아모레":              "아모레퍼시픽",
+    "LG생건":              "LG생활건강",
+    "HD현대일렉":          "HD현대일렉트릭",
+    "LS일렉":              "LS일렉트릭",
+    "한화시스":            "한화시스템",
+}
+
+# 동적 종목코드 매핑 — main()에서 KRX 데이터로 자동 구축
+KNOWN_STOCK_CODES = {}
+
+# 테마 정의 (AI 미사용 시 fallback)
+THEME_DEFINITIONS = [
+    {"name": "반도체",   "search_query": "반도체 주식",
+     "stocks": ["005930", "000660", "402340", "042700", "166090", "058470", "357780", "403870", "036930", "240810"]},
+    {"name": "2차전지",  "search_query": "2차전지 배터리 주식",
+     "stocks": ["373220", "247540", "086520", "003670", "051910", "298050", "112610", "006260"]},
+    {"name": "AI",       "search_query": "AI 인공지능 주식",
+     "stocks": ["005930", "000660", "035420", "017670", "030200", "036930"]},
+    {"name": "바이오",   "search_query": "바이오 제약 주식",
+     "stocks": ["068270", "207940", "000100", "128940", "196170", "141080", "145020", "302440"]},
+    {"name": "전기차",   "search_query": "전기차 자율주행 주식",
+     "stocks": ["005380", "000270", "373220", "018880", "012330"]},
+    {"name": "방산",     "search_query": "방산 방위산업 주식",
+     "stocks": ["012450", "079550", "047810", "000880", "064350"]},
+    {"name": "금융",     "search_query": "금융 은행 주식",
+     "stocks": ["105560", "055550", "086790", "316140", "032830", "000810"]},
+    {"name": "게임",     "search_query": "게임 엔터 주식",
+     "stocks": ["259960", "036570", "263750", "251270"]},
+    {"name": "에너지",   "search_query": "에너지 전력 주식",
+     "stocks": ["015760", "096770", "010950", "009830", "112610"]},
+    {"name": "건설",     "search_query": "건설 부동산 주식",
+     "stocks": ["000720", "047040", "006360", "375500", "028260"]},
+]
+
+
+# ─────────────────────────────────────────
+# Supabase 헬퍼
+# ─────────────────────────────────────────
+def supabase_request(method, table, data=None, params=None):
+    """Supabase REST API 직접 호출 (재시도 + 대용량 POST 배치 분할)"""
+    import time
+
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    # POST 대용량 데이터 배치 분할 (500개씩)
+    BATCH_SIZE = 500
+    if method == "POST" and isinstance(data, list) and len(data) > BATCH_SIZE:
+        all_results = []
+        for i in range(0, len(data), BATCH_SIZE):
+            batch = data[i:i + BATCH_SIZE]
+            result = supabase_request("POST", table, data=batch, params=params)
+            if result:
+                all_results.extend(result if isinstance(result, list) else [result])
+        return all_results if all_results else None
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if method == "GET":
+                resp = requests.get(url, headers=headers, params=params, timeout=30)
+            elif method == "POST":
+                headers["Prefer"] = "return=representation"
+                resp = requests.post(url, headers=headers, json=data, timeout=30)
+            elif method == "DELETE":
+                resp = requests.delete(url, headers=headers, params=params, timeout=30)
+            elif method == "PATCH":
+                resp = requests.patch(url, headers=headers, json=data, params=params, timeout=30)
+
+            if resp.status_code >= 400:
+                log(f"  ⚠️ Supabase 오류 ({table}): {resp.status_code} - {resp.text[:200]}")
+                return None
+
+            try:
+                return resp.json() if resp.text else None
+            except:
+                return None
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1초, 2초
+                log(f"  ⚠️ Supabase 연결 오류 ({table}), {wait}초 후 재시도 ({attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                log(f"  ❌ Supabase 연결 실패 ({table}): {e}")
+                return None
+
+
+def replace_table_rows(table, rows, label, batch_size=500):
+    """새 행을 먼저 저장하고, 전부 성공했을 때만 예전 행(id가 더 작은 것)을 지운다.
+    새 데이터가 비었거나 저장이 실패하면 예전 데이터를 그대로 둔다 (빈 테이블 방지)."""
+    if not rows:
+        log(f"  ⚠️ {label}: 새 데이터 0건 — 기존 데이터 유지")
+        return False
+    new_ids = []
+    ok = True
+    for i in range(0, len(rows), batch_size):
+        res = supabase_request("POST", table, data=rows[i:i + batch_size])
+        if not isinstance(res, list) or not res:
+            ok = False
+            break
+        new_ids.extend(r.get("id") for r in res if isinstance(r, dict) and r.get("id") is not None)
+    if not ok or not new_ids:
+        log(f"  ❌ {label} 저장 실패 — 기존 데이터 유지")
+        if new_ids:  # 일부만 들어간 새 행은 지움
+            supabase_request("DELETE", table, params={"id": f"gte.{min(new_ids)}"})
+        return False
+    supabase_request("DELETE", table, params={"id": f"lt.{min(new_ids)}"})
+    log(f"  📊 {label} {len(rows)}개 저장 ✅")
+    return True
+
+
+def clear_today_data(table):
+    """데이터 삭제 (중복 방지)"""
+    if table in ("market_index", "sectors", "issue_stocks", "themes"):
+        supabase_request("DELETE", table, params={"id": "gt.0"})
+    else:
+        supabase_request("DELETE", table, params={"date": f"eq.{TODAY}"})
+
+
+
+# ─────────────────────────────────────────
+# 네이버 금융 API (메인 데이터 소스)
+# ─────────────────────────────────────────
+NAVER_STOCK_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
+
+
+
+
+
+def _fetch_naver_stocks(market_type, page_size=100):
+    """네이버 금융 API에서 시장별 전종목 시세 조회"""
+    all_stocks = []
+    page = 1
+    while True:
+        try:
+            resp = requests.get(
+                f"https://m.stock.naver.com/api/stocks/marketValue/{market_type}",
+                params={"page": page, "pageSize": page_size},
+                headers=NAVER_STOCK_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log(f"  ⚠️ 네이버 {market_type} page {page}: HTTP {resp.status_code}")
+                break
+
+            data = resp.json()
+            stocks = data.get("stocks", [])
+            if not stocks:
+                break
+
+            all_stocks.extend(stocks)
+            total = data.get("totalCount", 0)
+
+            if page * page_size >= total:
+                break
+            page += 1
+
+        except Exception as e:
+            log(f"  ⚠️ 네이버 {market_type} page {page} 실패: {e}")
+            break
+
+    return all_stocks
+
+
+def fetch_investor_trend(code, price=0):
+    """네이버 금융 API에서 종목별 투자자 순매수 데이터 조회 (외국인/기관/개인)"""
+    try:
+        resp = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/trend",
+            params={"pageSize": 1},
+            headers=NAVER_STOCK_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data:
+            return None
+
+        latest = data[0]
+        def parse_num(s):
+            try:
+                return int(str(s).replace(",", "").replace("+", ""))
+            except (ValueError, TypeError):
+                return 0
+
+        foreign_qty = parse_num(latest.get("foreignerPureBuyQuant", "0"))
+        organ_qty = parse_num(latest.get("organPureBuyQuant", "0"))
+        individual_qty = parse_num(latest.get("individualPureBuyQuant", "0"))
+        hold_ratio = latest.get("foreignerHoldRatio", "0%")
+
+        try:
+            hold_pct = float(str(hold_ratio).replace("%", "").replace(",", ""))
+        except (ValueError, TypeError):
+            hold_pct = 0.0
+
+        # 순매수량(주) × 종가 → 억원 변환
+        eok = 100_000_000
+        foreign_net = round(foreign_qty * price / eok) if price > 0 else 0
+        institution_net = round(organ_qty * price / eok) if price > 0 else 0
+        individual_net = round(individual_qty * price / eok) if price > 0 else 0
+
+        return {
+            "foreign_net": foreign_net,       # 외국인 순매수 (억원)
+            "institution_net": institution_net, # 기관 순매수 (억원)
+            "individual_net": individual_net,   # 개인 순매수 (억원)
+            "foreign_ratio": hold_pct,          # 외국인 보유비율 (%)
+        }
+    except Exception as e:
+        log(f"  ⚠️ 투자자 동향 조회 실패 ({code}): {e}")
+        return None
+
+
+def fetch_naver_market_data(sector_map=None):
+    """네이버 금융 API에서 전종목 시세 데이터 조회 (KRX 대체)"""
+    log("📋 네이버 금융 API 전종목 시세 조회 중...")
+    if sector_map is None:
+        sector_map = {}
+    all_data = {}
+
+    for market_type, market_name in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
+        stocks = _fetch_naver_stocks(market_type)
+        count = 0
+
+        for item in stocks:
+            code = item.get("itemCode", "").strip()
+            name = item.get("stockName", "").strip()
+
+            if not code or not name or len(code) != 6 or not code.isdigit():
+                continue
+
+            # 우선주/ETF 등 제외
+            stock_end_type = item.get("stockEndType", "")
+            if stock_end_type not in ("stock", ""):
+                continue
+
+            try:
+                price = int(item.get("closePrice", "0").replace(",", ""))
+                change_pct = float(item.get("fluctuationsRatio", "0").replace(",", ""))
+                volume = int(item.get("accumulatedTradingVolume", "0").replace(",", ""))
+                trading_value = int(item.get("accumulatedTradingValue", "0").replace(",", "")) * 1_000_000  # 백만원→원
+                market_cap = int(item.get("marketValue", "0").replace(",", "")) * 100_000_000  # 억원→원
+            except (ValueError, TypeError):
+                continue
+
+            # 업종 매핑 (네이버 섹터 매핑 활용)
+            if code in BATTERY_STOCK_CODES:
+                display_sector = "2차전지"
+            else:
+                display_sector = sector_map.get(code, "")
+
+            all_data[code] = {
+                "code": code,
+                "name": name,
+                "market": market_name,
+                "display_sector": display_sector,
+                "price": price,
+                "change_pct": change_pct,
+                "volume": volume,
+                "trading_value": trading_value,
+                "market_cap": market_cap,
+            }
+            count += 1
+
+        log(f"  ✅ 네이버 {market_name}: {count}개 종목")
+
+    log(f"  📊 총 {len(all_data)}개 종목 로드 완료")
+    return all_data
+
+
+# ─────────────────────────────────────────
+# KRX 데이터 (Fallback)
+# ─────────────────────────────────────────
+def _fetch_krx_for_date(date_str, mkt_id, mkt_name):
+    """특정 날짜의 KRX 전종목 시세 조회"""
+    try:
+        resp = requests.post(
+            "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+            data={
+                "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+                "locale": "ko_KR",
+                "mktId": mkt_id,
+                "trdDd": date_str,
+                "share": "1",
+                "money": "1",
+                "csvxls_isNo": "false",
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
+            },
+            timeout=15,
+        )
+        items = resp.json().get("OutBlock_1", [])
+        return items
+    except Exception as e:
+        log(f"  ⚠️ KRX {mkt_name} ({date_str}) 조회 실패: {e}")
+        return []
+
+
+def fetch_krx_market_data():
+    """KRX에서 전종목 시세 데이터 동적 조회 (코드+이름+업종+가격+거래량+시총)"""
+    log("📋 KRX 전종목 시세 조회 중 (fallback)...")
+    all_data = {}
+
+    for days_back in range(5):
+        dt = datetime.now() - timedelta(days=days_back)
+        if dt.weekday() >= 5:
+            continue
+        date_str = dt.strftime("%Y%m%d")
+
+        for mkt_id, mkt_name in [("STK", "KOSPI"), ("KSQ", "KOSDAQ")]:
+            items = _fetch_krx_for_date(date_str, mkt_id, mkt_name)
+
+            for item in items:
+                code = item.get("ISU_SRT_CD", "").strip()
+                name = item.get("ISU_ABBRV", "").strip()
+                krx_sector = item.get("SECT_TP_NM", "").strip()
+
+                if not code or not name or len(code) != 6 or not code.isdigit():
+                    continue
+
+                try:
+                    price = int(item.get("TDD_CLSPRC", "0").replace(",", ""))
+                    change_pct = float(item.get("FLUC_RT", "0").replace(",", ""))
+                    volume = int(item.get("ACC_TRDVOL", "0").replace(",", ""))
+                    trading_value = int(item.get("ACC_TRDVAL", "0").replace(",", ""))
+                    market_cap = int(item.get("MKTCAP", "0").replace(",", ""))
+                except (ValueError, TypeError):
+                    continue
+
+                if code in BATTERY_STOCK_CODES:
+                    display_sector = "2차전지"
+                else:
+                    override = _sub_classify_sector(name, krx_sector)
+                    if override:
+                        display_sector = override
+                    else:
+                        display_sector = KRX_SECTOR_MAP.get(krx_sector, "")
+
+                all_data[code] = {
+                    "code": code,
+                    "name": name,
+                    "market": mkt_name,
+                    "krx_sector": krx_sector,
+                    "display_sector": display_sector,
+                    "price": price,
+                    "change_pct": change_pct,
+                    "volume": volume,
+                    "trading_value": trading_value,
+                    "market_cap": market_cap,
+                }
+
+            if items:
+                log(f"  ✅ KRX {mkt_name} ({date_str}): {len(items)}개 종목")
+
+        if all_data:
+            break
+        else:
+            log(f"  ⚠️ {date_str} 데이터 없음 - 이전 날짜 시도...")
+
+    log(f"  📊 KRX 총 {len(all_data)}개 종목 로드 완료")
+    return all_data
+
+
+# ─────────────────────────────────────────
+# KRX 섹터 매핑 (종목코드 → 업종)
+# ─────────────────────────────────────────
+SECTOR_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sector_map.json")
+
+# 화학 업종 내 소비재 재분류 키워드 (종목명 기반)
+CONSUMER_GOODS_KEYWORDS = [
+    "아모레", "LG생활", "코스맥스", "한국콜마", "클리오", "잇츠한불",
+    "애경", "콜마비앤에이치", "에이블씨엔씨", "토니모리", "네이처리퍼블릭",
+    "삼양식품", "오뚜기", "농심", "CJ제일", "대상", "롯데웰",
+    "동서", "삼립", "풀무원", "매일유업", "빙그레", "오리온",
+    "롯데칠성", "하이트진로", "코웨이", "아모레G", "LG H&H",
+]
+
+
+def fetch_naver_sector_map():
+    """네이버 금융 업종별 종목 페이지에서 종목코드 → 디스플레이 섹터 매핑 구축 (일 1회 캐시, 7일 유효)"""
+    # 캐시 확인
+    if os.path.exists(SECTOR_MAP_FILE):
+        try:
+            with open(SECTOR_MAP_FILE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cached_date = cached.get("date", "")
+            if cached_date == TODAY and cached.get("map"):
+                log(f"  📂 섹터 매핑 캐시 사용 ({len(cached['map'])}개 종목)")
+                return cached["map"]
+            days_old = (datetime.now() - datetime.strptime(cached_date, "%Y-%m-%d")).days if cached_date else 999
+            if days_old <= 7 and cached.get("map"):
+                stale_cache = cached["map"]
+            else:
+                stale_cache = None
+        except Exception:
+            stale_cache = None
+    else:
+        stale_cache = None
+
+    log("  🏗️ 네이버 업종별 섹터 매핑 조회 중...")
+    sector_map = {}  # code → display_sector
+
+    for naver_id, display_sector in NAVER_SECTOR_MAP.items():
+        try:
+            resp = requests.get(
+                f"https://finance.naver.com/sise/sise_group_detail.naver?type=upjong&no={naver_id}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=10,
+            )
+            html = resp.content.decode("euc-kr", errors="replace")
+            codes = re.findall(r'main\.naver\?code=(\d{6})', html)
+            for code in codes:
+                if code not in sector_map:
+                    sector_map[code] = display_sector
+        except Exception as e:
+            log(f"  ⚠️ 네이버 업종 {naver_id} 조회 실패: {e}")
+            continue
+
+    if not sector_map:
+        if stale_cache:
+            log(f"  ⚠️ 섹터 조회 실패 - 이전 캐시 사용 ({len(stale_cache)}개)")
+            return stale_cache
+        log("  ❌ 섹터 매핑 조회 실패")
+        return {}
+
+    log(f"  ✅ 네이버 섹터 매핑 완료: {len(sector_map)}개 종목")
+
+    # 캐시 저장
+    try:
+        with open(SECTOR_MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": TODAY, "map": sector_map}, f, ensure_ascii=False)
+        log(f"  💾 섹터 매핑 캐시 저장")
+    except Exception:
+        pass
+
+    return sector_map
+
+
+def _sub_classify_sector(name, krx_sector):
+    """화학 등 넓은 KRX 업종을 종목명 키워드로 세분화 (소비재 재분류)"""
+    if krx_sector in ("화학", "제조 - 화학"):
+        for kw in CONSUMER_GOODS_KEYWORDS:
+            if kw in name:
+                return "소비재"
+    return None
+
+
+def build_stock_code_map(krx_data):
+    """데이터에서 종목명 → (코드, 시장) 매핑 구축 (AI 코드 보정용)"""
+    mapping = {}
+    for code, info in krx_data.items():
+        mapping[info["name"]] = (code, info["market"])
+    # 별칭 추가 (양방향: alias→real, real→alias)
+    for alias, real_name in STOCK_NAME_ALIASES.items():
+        if real_name in mapping and alias not in mapping:
+            mapping[alias] = mapping[real_name]
+        if alias in mapping and real_name not in mapping:
+            mapping[real_name] = mapping[alias]
+    return mapping
+
+
+# ─────────────────────────────────────────
+# Yahoo Finance (시장 지수 전용)
+# ─────────────────────────────────────────
+def fetch_yahoo_chart(symbol, interval="15m"):
+    """Yahoo Finance v8 chart API로 단일 지수/환율 조회 + 당일 스파크라인 데이터"""
+    encoded = urllib.parse.quote(symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval={interval}&range=1d"
+    resp = requests.get(url, headers=YAHOO_HEADERS, timeout=10)
+    data = resp.json()
+    result = data["chart"]["result"][0]
+    meta = result["meta"]
+    price = meta.get("regularMarketPrice", 0)
+    prev = meta.get("previousClose", 0) or meta.get("chartPreviousClose", 0)
+
+    # 스파크라인용 당일 15분봉 종가 데이터 추출
+    quotes = result.get("indicators", {}).get("quote", [{}])[0]
+    closes = [round(c, 2) for c in quotes.get("close", []) if c is not None]
+
+    # 동일 가격 3봉 이상 연속 시 제외 (장 마감 후 평탄 구간 제거)
+    filtered = []
+    repeat_count = 0
+    last_val = None
+    for v in closes:
+        if v == last_val:
+            repeat_count += 1
+            if repeat_count >= 3:
+                continue
+        else:
+            repeat_count = 1
+            last_val = v
+        filtered.append(v)
+
+    # 최대 70포인트로 다운샘플링 (LTTB - 차트 형태 보존)
+    MAX_POINTS = 70
+    if len(filtered) > MAX_POINTS:
+        src = filtered
+        n = len(src)
+        sampled = [src[0]]  # 첫 점 유지
+        bucket_size = (n - 2) / (MAX_POINTS - 2)
+        prev_idx = 0
+        for i in range(1, MAX_POINTS - 1):
+            b_start = int((i - 1) * bucket_size) + 1
+            b_end = int(i * bucket_size) + 1
+            b_end = min(b_end, n)
+            # 다음 버킷 평균
+            nb_start = int(i * bucket_size) + 1
+            nb_end = int((i + 1) * bucket_size) + 1
+            nb_end = min(nb_end, n)
+            avg_next = sum(src[nb_start:nb_end]) / max(1, nb_end - nb_start)
+            # 현재 버킷에서 삼각형 면적 최대인 점 선택
+            best_idx = b_start
+            max_area = -1
+            for j in range(b_start, b_end):
+                area = abs((j - prev_idx) * (avg_next - src[prev_idx])
+                           - (prev_idx - prev_idx) * (src[j] - src[prev_idx]))
+                if area > max_area:
+                    max_area = area
+                    best_idx = j
+            sampled.append(src[best_idx])
+            prev_idx = best_idx
+        sampled.append(src[-1])  # 마지막 점 유지
+        filtered = sampled
+
+    return price, prev, filtered
+
+
+def fetch_naver_index_basic(code):
+    """네이버 금융 API로 한국 시장 지수 조회 (KOSPI/KOSDAQ)
+    Returns: (price, change, pct, trend) or None on failure
+    """
+    try:
+        resp = requests.get(
+            f"https://m.stock.naver.com/api/index/{code}/basic",
+            headers=NAVER_STOCK_HEADERS, timeout=10
+        )
+        if resp.status_code != 200:
+            return None
+        d = resp.json()
+
+        price = float(str(d.get("closePrice", "0")).replace(",", ""))
+        change_abs = float(str(d.get("compareToPreviousClosePrice", "0")).replace(",", "").lstrip("+-"))
+        pct_abs = float(str(d.get("fluctuationsRatio", "0")).replace(",", "").lstrip("+-"))
+
+        cmp = d.get("compareToPreviousPrice", {})
+        cmp_code = cmp.get("code", "3") if isinstance(cmp, dict) else "3"
+
+        if cmp_code in ("4", "5"):  # 하락/하한
+            return price, -change_abs, -pct_abs, "down"
+        elif cmp_code in ("1", "2"):  # 상한/상승
+            return price, change_abs, pct_abs, "up"
+        else:
+            return price, 0.0, 0.0, "flat"
+    except Exception as e:
+        log(f"  ⚠️ 네이버 {code} 지수 조회 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────
+def classify_news_category(title):
+    """뉴스 제목으로 카테고리 분류"""
+    categories = {
+        "반도체": ["반도체", "삼성전자", "SK하이닉스", "HBM", "메모리", "파운드리", "칩"],
+        "2차전지": ["2차전지", "배터리", "리튬", "양극재", "음극재", "에코프로", "LG에너지"],
+        "바이오": ["바이오", "제약", "신약", "임상", "셀트리온", "삼성바이오"],
+        "자동차": ["자동차", "현대차", "기아", "전기차", "EV", "자율주행"],
+        "IT": ["네이버", "카카오", "AI", "인공지능", "플랫폼", "클라우드"],
+        "금융": ["금리", "은행", "보험", "증권", "금융", "대출"],
+        "시장": ["코스피", "코스닥", "지수", "증시", "주가", "시총", "외국인", "기관"],
+        "글로벌": ["미국", "중국", "일본", "연준", "Fed", "환율", "달러", "나스닥", "다우"],
+        "부동산": ["부동산", "아파트", "건설", "분양", "PF"],
+        "에너지": ["원유", "가스", "석유", "에너지", "태양광", "풍력"],
+    }
+
+    for cat, keywords in categories.items():
+        if any(kw in title for kw in keywords):
+            return cat
+    return "시장"
+
+
+def analyze_sentiment(title):
+    """간단한 키워드 기반 감성 분석"""
+    positive_words = [
+        "상승", "급등", "최고", "호조", "돌파", "순매수", "확대", "성장",
+        "호실적", "수혜", "기대", "강세", "반등", "신고가", "흑자",
+    ]
+    negative_words = [
+        "하락", "급락", "폭락", "우려", "위축", "매도", "적자", "감소",
+        "약세", "리스크", "위기", "부진", "손실", "하회", "불안",
+    ]
+
+    pos = sum(1 for w in positive_words if w in title)
+    neg = sum(1 for w in negative_words if w in title)
+
+    if pos > neg:
+        return "positive"
+    elif neg > pos:
+        return "negative"
+    return "neutral"
+
+
+def format_trading_value(raw_text):
+    """거래대금 포맷 (억원 단위 → 읽기 쉬운 형태)"""
+    try:
+        val = float(raw_text.replace(",", "").replace(" ", "").strip())
+        if val >= 10000:
+            return f"{val/10000:.1f}조"
+        else:
+            return f"{int(val):,}억"
+    except:
+        return raw_text
+
+def is_etf_etn(name):
+    """ETF/ETN 종목 필터링"""
+    skip = ["ETN", "ETF", "KODEX", "TIGER", "RISE", "KBSTAR", "SOL", "HANARO",
+            "인버스", "레버리지", "액티브", "선물", "채권", "합성"]
+    return any(kw in name for kw in skip)
+
+
+# 테마 구체성 점수 (낮을수록 더 구체적 → 우선 노출)
+# 키워드 기반 신생 테마(로봇/AI/2차전지 등)는 구체적, 업종 기반 광범위 분류(기계/건설/화학)는 후순위
+THEME_SPECIFICITY = {
+    # 1순위: 가장 구체적이고 시장에서 활발히 거론되는 테마
+    "로봇": 1, "휴머노이드": 1, "AI": 1, "양자컴퓨터": 1, "양자": 1,
+    "드론": 1, "UAM": 1, "전기차": 1, "2차전지": 1,
+    "원전": 1, "SMR": 1, "수소": 1, "태양광": 1,
+    "피지컬AI": 1, "협동로봇": 1,
+    # 2순위: 특화 산업 (구체적이지만 광범위)
+    "방산": 2, "조선": 2, "디스플레이": 2, "전자부품": 2,
+    "엔터": 2, "게임": 2, "화장품": 2, "바이오시밀러": 2,
+    # 3순위: 일반 산업 분류
+    "반도체": 3, "자동차": 3, "제약/바이오": 3, "전력/에너지": 3,
+    "통신": 3, "항공": 3, "물류": 3, "해운": 3,
+    "의료기기": 3, "패션": 3, "유통": 3, "식품": 3,
+    "석유/가스": 3,
+    # 4순위: 광범위한 분류 (가장 후순위)
+    "기계": 5, "건설": 5, "화학": 5, "철강/소재": 5, "금융": 5,
+    "IT/플랫폼": 5,
+}
+
+
+def classify_stock_tags(name, display_sector="", theme_names=None, theme_map_themes=None):
+    """종목 태그 분류 (theme_map 우선, display_sector fallback)
+
+    theme_map_themes: build_theme_stock_map의 종목별 분류 (예: ["로봇", "기계"])
+    → 있으면 display_sector보다 우선 + 구체성 순으로 정렬하여 가장 구체적인 테마 노출
+    """
+    tags = []
+
+    # 1) theme_map 분류가 있으면 우선 (구체적인 테마 — 로봇, 방산, 조선 등)
+    if theme_map_themes:
+        # 핫 테마(theme_names)에 포함된 테마는 최우선 (오늘 시장의 맥락에 맞춤)
+        hot_set = set(theme_names) if theme_names else set()
+        sorted_themes = sorted(
+            theme_map_themes,
+            key=lambda t: (0 if t in hot_set else 1, THEME_SPECIFICITY.get(t, 5)),
+        )
+        for t in sorted_themes[:2]:
+            if t not in tags:
+                tags.append(t)
+    elif display_sector:
+        # fallback: 네이버 업종 기반 display_sector
+        tags.append(display_sector)
+
+    # 2) 인기 테마 소속이면 테마명 추가 (오늘의 핫 테마 표시 — 위에서 안 들어갔으면 추가)
+    if theme_names:
+        for t in theme_names:
+            if t not in tags:
+                tags.append(t)
+
+    # 3) 특수 태그 (종목명 기반, display_sector에 없는 분류)
+    special_tags = {
+        "AI": ["삼성전자", "SK하이닉스", "네이버", "카카오"],
+        "방산": ["한화에어로스페이스", "LIG넥스원", "한국항공우주", "현대로템"],
+    }
+    for tag, names in special_tags.items():
+        if tag not in tags and any(n in name for n in names):
+            tags.append(tag)
+
+    if not tags:
+        tags = ["기타"]
+
+    return tags[:3]
+
+
+def _calc_time_ago(pub_date_str):
+    """Naver API pubDate (RFC 822) -> '~시간 전' 형태"""
+    try:
+        pub = parsedate_to_datetime(pub_date_str)
+        now = datetime.now(pub.tzinfo)
+        diff = now - pub
+        hours = int(diff.total_seconds() // 3600)
+        if hours < 1:
+            minutes = max(1, int(diff.total_seconds() // 60))
+            return f"{minutes}분 전"
+        elif hours < 24:
+            return f"{hours}시간 전"
+        else:
+            return f"{hours // 24}일 전"
+    except:
+        return "오늘"
+
+
+def _is_similar_title(new_title, existing_titles, threshold=0.65):
+    """제목 유사도 체크 — 2글자 단위(bigram) 겹침이 threshold 이상이면 유사"""
+    def _bigrams(s):
+        s = re.sub(r'[^\w]', '', s)
+        return set(s[i:i+2] for i in range(len(s)-1)) if len(s) >= 2 else set()
+    new_bg = _bigrams(new_title)
+    if not new_bg:
+        return False
+    for t in existing_titles:
+        old_bg = _bigrams(t)
+        if not old_bg:
+            continue
+        overlap = len(new_bg & old_bg) / min(len(new_bg), len(old_bg))
+        if overlap > threshold:
+            return True
+    return False
+
+
+def _search_theme_news_api(query, theme_name=""):
+    """Naver Search API로 테마 관련 뉴스 검색 (최대 5건, 다양성 확보)"""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return "", "", "[]"
+    try:
+        url = "https://openapi.naver.com/v1/search/news.json"
+        headers = {
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        }
+        core_kw = query.replace("주식", "").replace("관련", "").strip()
+
+        # 다양한 쿼리로 검색 (테마명 주식 + 테마명 단독 + 테마명 관련주)
+        queries = [query]
+        if core_kw and core_kw != query:
+            queries.append(core_kw)
+        if core_kw:
+            queries.append(f"{core_kw} 관련주")
+
+        all_items = []
+        seen_urls = set()
+        for q in queries:
+            resp = requests.get(url, headers=headers, params={"query": q, "display": 10, "sort": "date"}, timeout=5)
+            for item in resp.json().get("items", []):
+                link = item.get("link", "")
+                if link not in seen_urls:
+                    all_items.append(item)
+                    seen_urls.add(link)
+
+        if not all_items:
+            return "", "", "[]"
+
+        # 테마 관련 키워드 목록 (테마명 + 핵심 단어들)
+        theme_kws = set()
+        if theme_name:
+            theme_kws.add(theme_name.replace(" ", "").lower())
+            # "제약/바이오" → {"제약바이오", "제약", "바이오"}
+            for part in re.split(r'[/·\s]', theme_name):
+                if len(part) >= 2:
+                    theme_kws.add(part.lower())
+        if core_kw:
+            theme_kws.add(core_kw.lower())
+            for part in re.split(r'[/·\s]', core_kw):
+                if len(part) >= 2:
+                    theme_kws.add(part.lower())
+
+        # 제목에 테마 키워드 포함된 뉴스만 선별 (언론사명 제외)
+        relevant = []
+        for item in all_items:
+            title = html.unescape(re.sub(r'<[^>]+>', '', item.get("title", ""))).strip()
+            if not title:
+                continue
+            # [데일리국제금융], (매일경제) 등 언론사명 제거 후 키워드 매칭
+            title_for_match = re.sub(r'[\[\(【].*?[\]\)】]', '', title)
+            title_lower = title_for_match.replace(" ", "").lower()
+            # 제외 키워드 체크 (동음이의어 오매칭 방지)
+            excludes = THEME_EXCLUDE_KEYWORDS.get(theme_name, [])
+            if excludes and any(ex.replace(" ", "").lower() in title_lower for ex in excludes):
+                continue
+            if any(kw in title_lower for kw in theme_kws):
+                relevant.append({"title": title, "url": item.get("link", "")})
+
+        # 유사도 필터링하며 5개 선별
+        cleaned = []
+        used_titles = []
+        for item in relevant:
+            if _is_similar_title(item["title"], used_titles):
+                continue
+            cleaned.append(item)
+            used_titles.append(item["title"])
+            if len(cleaned) >= 5:
+                break
+
+        news_list = cleaned[:5]
+        first_title = news_list[0]["title"] if news_list else ""
+        first_url = news_list[0]["url"] if news_list else ""
+        return first_title, first_url, json.dumps(news_list, ensure_ascii=False)
+    except Exception as e:
+        log(f"  ⚠️ 테마뉴스 검색 실패 ({query}): {e}")
+    return "", "", "[]"
+
+
+# ─────────────────────────────────────────
+# 테마-종목 매핑 DB (기업개요 기반)
+# ─────────────────────────────────────────
+THEME_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "theme_stock_map.json")
+
+
+def _fetch_company_overview(code):
+    """네이버 금융 PC에서 기업개요 + 업종 크롤링"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get(
+            f"https://finance.naver.com/item/main.naver?code={code}",
+            headers=headers, timeout=10,
+        )
+        html = resp.text
+
+        # 업종
+        sector = ""
+        sm = re.search(r'<a href="/sise/sise_group_detail\.naver[^"]*">([^<]+)</a>', html)
+        if sm:
+            sector = sm.group(1).strip()
+
+        # 기업개요 텍스트
+        overview = ""
+        om = re.search(r'class="wrap_company"(.*?)</table>', html, re.DOTALL)
+        if om:
+            raw = re.sub(r'<[^>]+>', ' ', om.group(1))
+            raw = re.sub(r'\s+', ' ', raw).strip()
+            # "기업개요" ~ "출처" 사이만 추출
+            start = raw.find("기업개요")
+            end = raw.find("출처")
+            if start >= 0:
+                overview = raw[start + 4:end].strip() if end > start else raw[start + 4:start + 500].strip()
+
+        return sector, overview
+    except Exception:
+        return "", ""
+
+
+def build_theme_stock_map(krx_data):
+    """네이버 업종 + 기업개요 키워드로 테마-종목 매핑 DB 구축 (AI 불필요)
+
+    캐시(7일) 유효 시 신규 상장/시총 진입 종목만 증분 분류하여 merge.
+    """
+
+    # 캐시 유효기간: 7일
+    CACHE_MAX_DAYS = 7
+    cached_stocks = {}
+    cached_processed = None  # None = 캐시 없음, set = 처리 이력
+    cached_date = None
+    cache_valid = False
+    if os.path.exists(THEME_MAP_FILE):
+        try:
+            with open(THEME_MAP_FILE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cached_date = cached.get("date", "")
+            cached_stocks = cached.get("stocks", {})
+            if cached_date and cached_stocks:
+                days_old = (datetime.strptime(TODAY, "%Y-%m-%d") - datetime.strptime(cached_date, "%Y-%m-%d")).days
+                if days_old < CACHE_MAX_DAYS:
+                    # 구버전 캐시(processed_codes 없음) 호환: stocks 키를 처리 이력으로 가정
+                    cached_processed = set(cached.get("processed_codes", list(cached_stocks.keys())))
+                    cache_valid = True
+                else:
+                    log(f"  🔄 테마 매핑 DB 캐시 만료 ({days_old}일 경과) - 재구축")
+        except Exception:
+            pass
+
+    if not cache_valid:
+        log("  🏗️ 테마-종목 매핑 DB 구축 시작 (업종+키워드 기반)...")
+
+    # ── 네이버 업종명 → 테마 매핑 룰 (정확히 일치하는 업종명) ──
+    SECTOR_TO_THEME = {
+        # 반도체
+        "반도체와반도체장비": "반도체",
+        # 2차전지
+        "전기제품": "2차전지",       # LG에너지솔루션, 삼성SDI, 에코프로비엠
+        # 자동차
+        "자동차": "자동차", "자동차부품": "자동차",
+        # 방산
+        "우주항공과국방": "방산",
+        # 조선
+        "조선": "조선",
+        # 제약/바이오
+        "제약": "제약/바이오", "생물공학": "제약/바이오",
+        "생명과학도구및서비스": "제약/바이오",
+        "건강관리업체및서비스": "제약/바이오",
+        # 전력/에너지
+        "전기유틸리티": "전력/에너지", "전기장비": "전력/에너지",
+        "가스유틸리티": "전력/에너지", "에너지장비및서비스": "전력/에너지",
+        # 금융
+        "은행": "금융", "증권": "금융", "생명보험": "금융", "손해보험": "금융",
+        "카드": "금융",
+        # 건설
+        "건설": "건설", "건축자재": "건설",
+        # 통신
+        "무선통신서비스": "통신", "다각화된통신서비스": "통신", "통신장비": "통신",
+        # 철강/소재
+        "철강": "철강/소재", "비철금속": "철강/소재", "화학": "화학",
+        # IT/플랫폼
+        "양방향미디어와서비스": "IT/플랫폼", "소프트웨어": "IT/플랫폼",
+        "IT서비스": "IT/플랫폼",
+        # 게임
+        "게임엔터테인먼트": "게임",
+        # 디스플레이
+        "디스플레이패널": "디스플레이", "디스플레이장비": "디스플레이",
+        # 화장품
+        "화장품": "화장품",
+        # 식품
+        "식품": "식품",
+        # 엔터
+        "방송과엔터테인먼트": "엔터",
+        # 전자/부품
+        "전자장비와기기": "전자부품", "전자제품": "전자부품",
+        # 항공/물류/해운
+        "항공사": "항공", "항공화물운송과물류": "물류", "해운사": "해운",
+        # 의료기기
+        "건강관리장비와용품": "의료기기",
+        # 패션
+        "섬유,의류,신발,호화품": "패션",
+        # 유통
+        "백화점과일반상점": "유통", "인터넷과카탈로그소매": "유통",
+        # 석유/가스
+        "석유와가스": "석유/가스",
+        # 기계 (로봇 등은 키워드로 추가 분류)
+        "기계": "기계",
+    }
+
+    # ── 기업개요 키워드 → 테마 매핑 (업종 보완용) ──
+    KEYWORD_TO_THEME = {
+        # 2차전지 (화학 업종 내 2차전지 기업 분류)
+        "2차전지": "2차전지", "배터리": "2차전지", "양극재": "2차전지", "음극재": "2차전지",
+        "리튬": "2차전지", "전해질": "2차전지", "분리막": "2차전지", "양극소재": "2차전지",
+        "이차전지": "2차전지", "전구체": "2차전지",
+        # 전기차
+        "전기차": "전기차", "전기자동차": "전기차",
+        # AI (엄격: 핵심 AI 사업 키워드만)
+        "HBM": "AI", "AI반도체": "AI", "생성형AI": "AI",
+        "NPU": "AI", "딥러닝": "AI", "LLM": "AI",
+        "AI서버": "AI", "AI데이터센터": "AI", "AI칩": "AI",
+        # 로봇 (기계 업종 내 로봇 기업 분류)
+        "로봇": "로봇", "로보틱스": "로봇", "코봇": "로봇", "자동화장비": "로봇",
+        # 원전
+        "원전": "원전", "원자력": "원전", "소형모듈원자로": "원전",
+        # 수소
+        "수소": "수소", "연료전지": "수소",
+        # 태양광
+        "태양광": "태양광", "태양전지": "태양광", "솔라셀": "태양광",
+        # 드론
+        "드론": "드론", "무인항공": "드론",
+        # 조선 (키워드 보강)
+        "선박": "조선", "LNG선": "조선",
+        # 방산 (키워드 보강)
+        "방산": "방산", "방위산업": "방산", "무기체계": "방산", "장갑차": "방산",
+    }
+
+    # 짧은 영문 키워드는 정규식으로 별도 처리 (단어 경계 매칭)
+    import re as _re
+    SHORT_KEYWORD_PATTERNS = [
+        (_re.compile(r'(?<![A-Za-z])GPU(?![A-Za-z])'), "AI"),
+        (_re.compile(r'(?<![A-Za-z])EV(?![A-Za-z])'), "전기차"),
+        (_re.compile(r'(?<![A-Za-z])SMR(?![A-Za-z])'), "원전"),
+        (_re.compile(r'(?<![A-Za-z])UAM(?![A-Za-z])'), "드론"),
+    ]
+
+    # 시총 3000억+ 종목 필터 (우선주 제외)
+    MIN_MARKET_CAP = 300_000_000_000
+    eligible = []
+    for code, d in krx_data.items():
+        if d.get("market_cap", 0) >= MIN_MARKET_CAP:
+            if code[-1] in ("5", "7", "8", "9") and "우" in d["name"]:
+                continue
+            eligible.append((code, d["name"], d["market"]))
+    eligible.sort(key=lambda x: krx_data[x[0]].get("market_cap", 0), reverse=True)
+
+    # 증분 빌드: 캐시 유효 시 미처리 종목만 분류
+    if cache_valid:
+        eligible_to_fetch = [item for item in eligible if item[0] not in cached_processed]
+        if not eligible_to_fetch:
+            log(f"  📂 테마 매핑 DB 캐시 사용 ({len(cached_stocks)}개 종목, 신규 0개)")
+            return cached.get("theme_to_stocks", {}), cached_stocks
+        log(f"  📂 테마 매핑 DB 캐시 사용 ({len(cached_stocks)}개) + 신규 종목 증분 분류 ({len(eligible_to_fetch)}개)")
+        stock_themes = dict(cached_stocks)
+        processed_codes = set(cached_processed)
+    else:
+        log(f"  📋 대상 종목: {len(eligible)}개 (시총 3000억+)")
+        eligible_to_fetch = eligible
+        stock_themes = {}
+        processed_codes = set()
+
+    # 기업개요 병렬 크롤링
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    stock_infos = {}
+    done_count = [0]
+
+    def _fetch_one(item):
+        code, name, market = item
+        sector, overview = _fetch_company_overview(code)
+        return code, name, market, sector, overview
+
+    log(f"  ⏳ 기업개요 병렬 크롤링 중 (스레드 20개, {len(eligible_to_fetch)}개)...")
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(_fetch_one, item): item for item in eligible_to_fetch}
+        for future in as_completed(futures):
+            try:
+                code, name, market, sector, overview = future.result()
+                stock_infos[code] = {
+                    "name": name, "market": market,
+                    "sector": sector, "overview": overview[:500],
+                }
+                done_count[0] += 1
+                if done_count[0] % 200 == 0:
+                    log(f"     ... {done_count[0]}/{len(eligible_to_fetch)} 기업개요 수집")
+            except Exception:
+                pass
+
+    log(f"  ✅ 기업개요 수집 완료: {len(stock_infos)}개")
+
+    # ── 룰 기반 테마 분류 (신규 종목만) ──
+    new_classified = 0
+    for code, info in stock_infos.items():
+        themes = set()
+        sector = info.get("sector", "")
+        overview = info.get("overview", "")
+
+        # 1) 업종명 매핑 (정확히 일치하는 항목)
+        if sector in SECTOR_TO_THEME:
+            themes.add(SECTOR_TO_THEME[sector])
+
+        # 2) 기업개요 키워드 매핑 (공백 무시)
+        overview_nospace = overview.replace(" ", "")
+        for keyword, theme in KEYWORD_TO_THEME.items():
+            if keyword in overview_nospace:
+                themes.add(theme)
+
+        # 3) 짧은 영문 키워드 정규식 매칭 (EV, GPU 등)
+        for pattern, theme in SHORT_KEYWORD_PATTERNS:
+            if pattern.search(overview):
+                themes.add(theme)
+
+        processed_codes.add(code)  # 테마 없어도 처리 이력에 기록 (재크롤 방지)
+        if themes:
+            stock_themes[code] = list(themes)
+            new_classified += 1
+
+    if cache_valid:
+        log(f"  ✅ 신규 분류 완료: +{new_classified}개 → 총 {len(stock_themes)}개")
+    else:
+        log(f"  ✅ 테마 분류 완료: {len(stock_themes)}개 종목 (룰 기반)")
+
+    # 테마 → 종목 역매핑 (krx_data 기반, 시총 컷 재적용)
+    theme_to_stocks = {}
+    for code, themes_list in stock_themes.items():
+        d = krx_data.get(code)
+        if not d:
+            continue  # 상폐/삭제 종목
+        if d.get("market_cap", 0) < MIN_MARKET_CAP:
+            continue  # 시총이 컷 아래로 내려간 종목 (캐시는 유지, 노출만 제외)
+        for theme in themes_list:
+            if theme not in theme_to_stocks:
+                theme_to_stocks[theme] = []
+            theme_to_stocks[theme].append({
+                "code": code, "name": d.get("name", ""),
+                "market": d.get("market", ""),
+            })
+
+    # JSON 저장 (캐시 빌드 날짜는 보존하여 7일 만료 시계 유지)
+    save_date = cached_date if cache_valid else TODAY
+    cache_data = {
+        "date": save_date,
+        "stocks": stock_themes,
+        "theme_to_stocks": theme_to_stocks,
+        "processed_codes": sorted(processed_codes),
+    }
+    try:
+        with open(THEME_MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        log(f"  💾 테마 매핑 DB 저장: {THEME_MAP_FILE}")
+    except Exception as e:
+        log(f"  ⚠️ 매핑 DB 저장 실패: {e}")
+
+    for theme, stocks in sorted(theme_to_stocks.items(), key=lambda x: -len(x[1]))[:15]:
+        names = ", ".join(s["name"] for s in stocks[:5])
+        log(f"     {theme}({len(stocks)}개): {names}...")
+
+    return theme_to_stocks, stock_themes
+
+
+# ─────────────────────────────────────────
+# 네이버 증권 테마 (인기 테마 탭·주도주·급등 AI 공통 기준)
+# ─────────────────────────────────────────
+# 하루 1번 네이버 테마 목록(약 260개)과 테마별 종목을 받아 저장.
+# 네이버가 종목을 넣고 빼면 다음 날 첫 크롤링에서 자동 반영.
+NAVER_THEME_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "naver_theme_map.json")
+NAVER_THEME_API = "https://m.stock.naver.com/api/stocks/theme"
+NAVER_THEME_MIN_COUNT = 100        # 이보다 적게 받으면 실패로 보고 저장본 사용
+NAVER_THEME_ACTIVE = False         # 이번 실행에서 theme_map이 네이버 테마인지 (뉴스 점수 방식 선택용)
+
+
+def _fetch_naver_theme_members(no):
+    codes, page = [], 1
+    while page <= 10:
+        r = requests.get(f"{NAVER_THEME_API}/{no}", params={"page": page, "pageSize": 100},
+                         headers=NAVER_STOCK_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        st = (r.json() or {}).get("stocks") or []
+        codes += [s.get("itemCode") for s in st if s.get("itemCode")]
+        if len(st) < 100:
+            break
+        page += 1
+    return codes
+
+
+def fetch_naver_themes(force=False):
+    """네이버 테마 {테마명: [종목코드...]} (전 종목, 시총 컷 없음). 오늘 받은 저장본이 있으면 그대로."""
+    cached = None
+    if os.path.exists(NAVER_THEME_FILE):
+        try:
+            with open(NAVER_THEME_FILE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+        except Exception:
+            cached = None
+    if cached and cached.get("date") == TODAY and cached.get("themes") and not force:
+        return cached["themes"]
+
+    log("  🌐 네이버 테마 목록 받는 중...")
+    groups = []
+    try:
+        for page in range(1, 6):
+            r = requests.get(NAVER_THEME_API, params={"page": page, "pageSize": 100},
+                             headers=NAVER_STOCK_HEADERS, timeout=10)
+            g = (r.json() or {}).get("groups") or [] if r.status_code == 200 else []
+            groups += g
+            if len(g) < 100:
+                break
+    except Exception as e:
+        log(f"  ⚠️ 네이버 테마 목록 실패: {e}")
+
+    themes = {}
+    if groups:
+        from concurrent.futures import ThreadPoolExecutor
+        def one(g):
+            try:
+                return g.get("name", "").strip(), _fetch_naver_theme_members(g.get("no"))
+            except Exception:
+                return g.get("name", "").strip(), None
+        with ThreadPoolExecutor(5) as ex:
+            for name, codes in ex.map(one, groups):
+                if name and codes:
+                    themes[name] = list(dict.fromkeys(codes))
+
+    if len(themes) < NAVER_THEME_MIN_COUNT:
+        if cached and cached.get("themes"):
+            log(f"  ⚠️ 네이버 테마 {len(themes)}개만 받음 → 저장본({cached.get('date')}) 사용")
+            return cached["themes"]
+        log(f"  ⚠️ 네이버 테마 {len(themes)}개만 받음, 저장본도 없음")
+        return themes or None
+
+    # 바뀐 점 기록 (로그)
+    if cached and cached.get("themes"):
+        old = cached["themes"]
+        added = [t for t in themes if t not in old]
+        gone = [t for t in old if t not in themes]
+        moved = sum(len(set(themes[t]) ^ set(old[t])) for t in themes if t in old)
+        log(f"  🔄 네이버 테마 변경: 새 테마 {len(added)}개 · 없어진 테마 {len(gone)}개 · 종목 편입/편출 {moved}건"
+            + (f" (새: {', '.join(added[:5])})" if added else ""))
+    try:
+        with open(NAVER_THEME_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": TODAY, "themes": themes}, f, ensure_ascii=False)
+    except Exception as e:
+        log(f"  ⚠️ 네이버 테마 저장 실패: {e}")
+    log(f"  ✅ 네이버 테마 {len(themes)}개 · 평균 {sum(map(len, themes.values())) / len(themes):.0f}종목")
+    return themes
+
+
+def build_naver_theme_map(krx_data, min_cap=300_000_000_000):
+    """네이버 테마 → theme_map 형식 {테마명: [{code,name,market}]} (시총 컷, 시총 큰 순). 실패하면 None"""
+    raw = fetch_naver_themes()
+    if not raw:
+        return None
+    out = {}
+    for name, codes in raw.items():
+        rows = []
+        for c in codes:
+            d = krx_data.get(c)
+            if not d or d.get("market_cap", 0) < min_cap or is_etf_etn(d.get("name", "")):
+                continue
+            rows.append({"code": c, "name": d.get("name", ""), "market": d.get("market", ""),
+                         "_cap": d.get("market_cap", 0)})
+        if len(rows) >= 2:
+            rows.sort(key=lambda x: -x["_cap"])
+            out[name] = [{k: v for k, v in r.items() if k != "_cap"} for r in rows]
+    return out or None
+
+
+_THEME_STOP = {"관련", "관련주", "등", "기타", "테마", "산업", "사업", "종목", "및", "외"}
+
+
+def naver_theme_keywords(name):
+    """네이버 테마명에서 뉴스 매칭용 단어 (+ 기존 키워드 사전에서 이름이 겹치는 테마의 키워드)"""
+    toks = [t for t in re.split(r"[\s/(),·\-\[\]&+]+", name) if len(t) >= 2 and t not in _THEME_STOP]
+    kws = set(toks)
+    for old, words in NEWS_THEME_KEYWORDS.items():
+        if len(old) >= 2 and old in name:
+            kws.update(words)
+    return [k for k in kws if len(k) >= 2]
+
+
+# ─────────────────────────────────────────
+# 규칙 기반 테마 감지 (뉴스 키워드 매칭)
+# ─────────────────────────────────────────
+# 뉴스 헤드라인 → 테마 매칭 키워드
+# 테마별 제외 키워드 (동음이의어 오매칭 방지)
+THEME_EXCLUDE_KEYWORDS = {
+    "조선": ["조선학교", "조선일보", "조선시대", "조선왕조", "조선족", "조선대", "북조선"],
+}
+
+NEWS_THEME_KEYWORDS = {
+    "반도체": ["반도체", "HBM", "메모리", "파운드리", "삼성전자", "SK하이닉스", "DRAM", "낸드", "NAND", "D램",
+               "AI서버", "CXL", "첨단패키징", "유리기판", "HBM4",
+               "HBM3E", "반도체장비", "한미반도체", "소부장"],
+    "2차전지": ["2차전지", "배터리", "리튬", "양극재", "음극재", "에코프로", "LG에너지", "전고체",
+                "ESS", "LFP", "나트륨이온", "폐배터리",
+                "분리막", "삼성SDI", "포스코퓨처엠"],
+    "전기차": ["전기차", "EV", "테슬라", "자율주행", "전기자동차",
+               "충전인프라", "SDV"],
+    "자동차": ["자동차", "현대차", "기아", "완성차",
+               "스마트카", "커넥티드카", "전장화"],
+    "방산": ["방산", "방위", "무기", "미사일", "K방산", "K-방산", "한화에어로", "LIG넥스원", "K9", "국방", "군사", "군수", "전투기", "방위사업", "방사청", "한화시스템", "현대로템", "한국항공우주", "한화디펜스", "풍산", "KF-21", "K2전차", "천무", "폴란드", "NATO", "무장", "우크라이나", "국방비", "군비", "FA-50", "잠수함", "이지스", "천궁", "L-SAM", "요격", "스텔스", "정찰위성",
+            "국방예산", "무인체계", "탄약", "레이저무기",
+            "이란", "중동전쟁", "군비경쟁", "방공", "KAI", "나토"],
+    "조선": ["조선", "선박", "LNG선", "HD한국조선", "한화오션", "수주",
+             "해양플랜트", "삼성중공업", "수주잔고", "HD현대중공업"],
+    "AI": ["AI", "인공지능", "ChatGPT", "딥러닝", "생성형", "GPU", "엔비디아", "LLM", "챗봇",
+           "AI에이전트", "멀티모달", "데이터센터", "AI추론", "AI인프라"],
+    "로봇": ["로봇", "휴머노이드", "로보틱스", "코봇",
+             "협동로봇", "두산로보틱스", "피지컬AI"],
+    "제약/바이오": ["바이오", "제약", "신약", "임상", "셀트리온", "삼성바이오", "FDA", "치료제",
+                   "GLP-1", "ADC", "CDMO", "비만치료제",
+                   "바이오시큐어", "기술수출", "알테오젠", "한미약품"],
+    "전력/에너지": ["전력", "변압기", "송전", "전력망", "그리드", "한전",
+                   "HVDC", "초고압", "HD현대일렉트릭", "LS일렉트릭", "전력설비"],
+    "금융": ["금융", "은행", "보험", "증권", "금리", "기준금리",
+             "밸류업", "주주환원", "STO", "토큰증권",
+             "코리아디스카운트", "저PBR", "자사주소각"],
+    "건설": ["건설", "아파트", "부동산", "분양", "재건축", "재개발",
+             "SOC", "스마트시티"],
+    "통신": ["통신", "5G", "6G", "KT", "SKT", "LGU+",
+             "위성통신", "엣지컴퓨팅"],
+    "철강/소재": ["철강", "포스코", "비철금속", "알루미늄",
+                 "희토류"],
+    "화학": ["화학", "석유화학", "정밀화학",
+             "전해질", "바이오플라스틱"],
+    "IT/플랫폼": ["네이버", "카카오", "플랫폼", "IT기업",
+                  "SaaS", "클라우드", "빅데이터"],
+    "게임": ["게임", "넥슨", "크래프톤", "엔씨소프트", "넷마블",
+             "e스포츠", "VR", "AR"],
+    "디스플레이": ["디스플레이", "OLED", "LCD", "LG디스플레이", "패널",
+                  "마이크로LED", "XR"],
+    "화장품": ["화장품", "뷰티", "K뷰티", "K-뷰티", "아모레",
+               "클린뷰티"],
+    "식품": ["식품", "음식", "음료", "CJ제일제당",
+             "HMR", "K푸드", "K-푸드", "건강식품"],
+    "엔터": ["엔터", "K-POP", "KPOP", "아이돌", "콘서트", "공연", "하이브", "SM",
+             "OTT"],
+    "원전": ["원전", "원자력", "SMR", "소형모듈원자로", "핵발전",
+             "원전수출", "원전해체", "두산에너빌리티", "한전기술", "소형원전"],
+    "태양광": ["태양광", "태양전지", "솔라", "한화솔루션",
+               "BIPV", "재생에너지"],
+    "수소": ["수소", "연료전지", "수소차", "수전해",
+             "청정수소", "액화수소"],
+    "드론": ["드론", "UAM", "무인항공", "도심항공",
+             "무인기"],
+    "항공": ["항공", "대한항공", "아시아나", "저비용항공",
+             "MRO", "항공엔진"],
+    "물류": ["물류", "택배", "해운", "CJ대한통운",
+             "풀필먼트"],
+    "해운": ["해운", "HMM", "컨테이너선", "벌크선",
+             "SCFI", "운임", "홍해"],
+    "의료기기": ["의료기기", "진단", "의료장비",
+                "디지털헬스케어", "로봇수술", "웨어러블"],
+    "패션": ["패션", "의류", "브랜드",
+             "K패션", "K-패션"],
+    "유통": ["유통", "백화점", "이커머스", "쿠팡",
+             "라이브커머스"],
+    "전자부품": ["전자부품", "MLCC", "PCB", "커넥터",
+                "SiC", "전력반도체"],
+    "석유/가스": ["원유", "석유", "가스", "유가", "정유",
+                 "LNG", "셰일", "호르무즈", "국제유가"],
+}
+
+
+def load_theme_keywords_from_db():
+    """Supabase theme_keywords 테이블에서 추가 키워드를 읽어와 NEWS_THEME_KEYWORDS에 병합"""
+    try:
+        rows = supabase_request("GET", "theme_keywords", params={
+            "select": "theme,keyword",
+            "enabled": "eq.true",
+        })
+        if not rows:
+            return
+        added = 0
+        for row in rows:
+            theme = row.get("theme", "").strip()
+            keyword = row.get("keyword", "").strip()
+            if not theme or not keyword:
+                continue
+            if theme not in NEWS_THEME_KEYWORDS:
+                NEWS_THEME_KEYWORDS[theme] = []
+            if keyword not in NEWS_THEME_KEYWORDS[theme]:
+                NEWS_THEME_KEYWORDS[theme].append(keyword)
+                added += 1
+        if added:
+            log(f"  📥 DB 키워드 {added}개 병합 완료 (theme_keywords 테이블)")
+    except Exception as e:
+        log(f"  ⚠️ DB 키워드 로딩 실패 (코드 키워드 사용): {e}")
+
+
+def _score_theme_stock_relevance(name, chg, theme_name, theme_avg_chg, news_titles):
+    """
+    Phase 1: 테마-종목 관련도 점수 (0~100)
+    - 동반 상승 sign + 크기 정합성 (이탈자 감지)
+    - 뉴스 타이틀에서 종목명 + 테마키워드 공동 언급
+    기업개요 기반 매핑에 오늘의 시장 맥락을 덧씌워 오분류를 걸러냄.
+    """
+    if not name or len(name) < 2:
+        return 30.0
+
+    score = 30.0  # 기본점 (기업개요/업종 매핑 baseline)
+
+    # 1. 동반 상승 방향 일치
+    if theme_avg_chg > 0.2 and chg > 0.2:
+        score += 10
+    elif theme_avg_chg < -0.2 and chg < -0.2:
+        score += 10
+
+    # 2. 크기 정합성 — 핵심: 이탈자(다른 재료로 상승) 감지
+    abs_theme = max(abs(theme_avg_chg), 0.3)
+    ratio = abs(chg) / abs_theme
+    if 0.3 <= ratio <= 2.5:
+        score += 15
+    elif ratio >= 4.0 and ((theme_avg_chg > 0) == (chg > 0)):
+        # 같은 방향인데 너무 크게 이탈 → 다른 재료로 혼자 튐
+        score -= 20
+
+    # 3. 뉴스 타이틀 co-mention (종목명 + 테마 키워드 동시 등장)
+    theme_keywords = NEWS_THEME_KEYWORDS.get(theme_name, [])
+    if theme_keywords and news_titles:
+        co_mentions = 0
+        name_mentions = 0
+        for title in news_titles[:300]:
+            if not title:
+                continue
+            if name in title:
+                name_mentions += 1
+                if any(kw in title for kw in theme_keywords):
+                    co_mentions += 1
+        if co_mentions > 0:
+            score += 25
+        elif name_mentions >= 2:
+            # 뉴스 자주 나왔는데 테마 키워드 동반 없음 → 다른 이슈
+            score -= 12
+
+    return score
+
+
+def detect_themes_rule_based(news_titles, theme_map=None, krx_data=None):
+    """뉴스 헤드라인 키워드 매칭 + 등락률 복합 점수로 핫 테마 선정"""
+    if not news_titles:
+        log("  ⚠️ 뉴스 데이터 없음 - 정적 테마 사용")
+        return None
+
+    if not theme_map:
+        log("  ⚠️ 매핑 DB 없음 - 정적 테마 사용")
+        return None
+
+    # DB에서 추가 키워드 병합 (코드 키워드 + DB 키워드)
+    load_theme_keywords_from_db()
+
+    # 뉴스 헤드라인에서 테마별 언급 빈도 계산
+    theme_scores = {}
+    for title in news_titles:
+        matched_themes = set()
+        for theme, keywords in NEWS_THEME_KEYWORDS.items():
+            excludes = THEME_EXCLUDE_KEYWORDS.get(theme, [])
+            if excludes and any(ex in title for ex in excludes):
+                continue
+            for kw in keywords:
+                if kw in title:
+                    matched_themes.add(theme)
+                    break
+        for theme in matched_themes:
+            theme_scores[theme] = theme_scores.get(theme, 0) + 1
+
+    # theme_map에 존재하는 테마만 필터 (유사 이름 매칭 포함)
+    valid_scores = {}
+    if NAVER_THEME_ACTIVE:
+        # 네이버 테마: 테마명 단어 + 겹치는 기존 키워드로 헤드라인을 직접 셈
+        for map_key in theme_map:
+            kws = naver_theme_keywords(map_key)
+            if kws:
+                valid_scores[map_key] = sum(1 for t in news_titles if any(k in t for k in kws))
+    for theme, score in ({} if NAVER_THEME_ACTIVE else theme_scores).items():
+        if theme in theme_map:
+            valid_scores[theme] = valid_scores.get(theme, 0) + score
+        else:
+            for map_key in theme_map:
+                if theme in map_key or map_key in theme:
+                    valid_scores[map_key] = valid_scores.get(map_key, 0) + score
+                    break
+
+    # 전체 테마 대상으로 확장 (뉴스 언급 없는 테마도 등락률로 진입 가능)
+    for map_key in theme_map:
+        if map_key not in valid_scores:
+            valid_scores[map_key] = 0
+
+    # ── 테마별 평균 등락률 계산 (krx_data 활용) ──
+    theme_changes = {}
+    if krx_data:
+        for theme_name in valid_scores:
+            stocks = theme_map.get(theme_name, [])
+            changes = []
+            for s in stocks[:10]:
+                code = s["code"] if isinstance(s, dict) else s
+                d = krx_data.get(code)
+                if d and d.get("price", 0) > 0:
+                    changes.append(d["change_pct"])
+            if changes:
+                theme_changes[theme_name] = sum(changes) / len(changes)
+
+    # ── 복합 점수: 뉴스(50%) + 등락률(50%) ──
+    max_news = max(valid_scores.values()) if valid_scores and max(valid_scores.values()) > 0 else 1
+    change_values = [v for v in theme_changes.values()]
+    max_change = max(change_values) if change_values else 1
+    min_change = min(change_values) if change_values else 0
+    change_range = max_change - min_change if max_change != min_change else 1
+
+    combined_scores = {}
+    for theme_name in valid_scores:
+        news_norm = valid_scores[theme_name] / max_news * 50
+        avg_change = theme_changes.get(theme_name, 0)
+        change_norm = (avg_change - min_change) / change_range * 50
+        combined_scores[theme_name] = news_norm + change_norm
+
+    # 복합 점수순 정렬, 동점 시 종목 수
+    sorted_themes = sorted(
+        combined_scores.items(),
+        key=lambda x: (x[1], len(theme_map.get(x[0], []))),
+        reverse=True,
+    )
+    if NAVER_THEME_ACTIVE:
+        # 네이버 테마는 비슷한 테마가 많음(반도체 대표주/장비/재료/HBM…) →
+        # 대표 종목 5개 중 절반 이상이 이미 고른 테마와 겹치면 건너뜀
+        # + 이름 첫 단어가 같은 테마(반도체 대표주/반도체 장비/반도체 기판…)는 2개까지만
+        picked, seen, fam = [], [], {}
+        for name, sc in sorted_themes:
+            top5 = {(s["code"] if isinstance(s, dict) else s) for s in theme_map.get(name, [])[:5]}
+            if len(theme_map.get(name, [])) < 3:
+                continue
+            if any(len(top5 & prev) >= max(1, len(top5) // 2 + 1) for prev in seen):
+                continue
+            f0 = re.split(r"[\s/(]", name)[0]
+            if fam.get(f0, 0) >= 2:
+                continue
+            fam[f0] = fam.get(f0, 0) + 1
+            picked.append((name, sc)); seen.append(top5)
+            if len(picked) >= 10:
+                break
+        sorted_themes = picked
+    else:
+        sorted_themes = sorted_themes[:10]
+
+    result = []
+    for theme_name, score in sorted_themes:
+        stocks = theme_map.get(theme_name, [])[:10]
+        if len(stocks) >= 3:
+            result.append({
+                "name": theme_name,
+                "search_query": theme_name + " 주식",
+                "stocks": stocks,
+            })
+
+    if result:
+        total_stocks = sum(len(t["stocks"]) for t in result)
+        log(f"  🔍 규칙 기반 테마 감지: {len(result)}개 테마, {total_stocks}개 종목")
+        for t in result:
+            news_s = valid_scores.get(t["name"], 0)
+            chg = theme_changes.get(t["name"], 0)
+            combo = combined_scores.get(t["name"], 0)
+            names = ", ".join(s["name"] for s in t["stocks"][:3])
+            log(f"     - {t['name']} (뉴스 {news_s}건, 등락 {chg:+.2f}%, 점수 {combo:.1f}): {names}...")
+        return result
+    else:
+        log("  ⚠️ 규칙 기반 매칭 실패")
+        return None
+
+
+# ─────────────────────────────────────────
+# AI 테마 감지 (Groq / Llama 3.3 70B) — 주 1회
+# ─────────────────────────────────────────
+AI_THEME_CACHE_FILE = "ai_themes_cache.json"
+
+
+def _should_run_ai_themes():
+    """캐시 파일을 확인하여 AI 테마 감지를 실행할지 결정 (7일 경과 시 실행)"""
+    if not GROQ_API_KEY:
+        return False
+    try:
+        with open(AI_THEME_CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        cached_date = cache.get("date", "")
+        if cached_date:
+            from datetime import datetime as _dt
+            diff = (_dt.strptime(TODAY, "%Y-%m-%d") - _dt.strptime(cached_date, "%Y-%m-%d")).days
+            if diff < 7:
+                log(f"  ℹ️ AI 테마 캐시 유효 ({cached_date}, {diff}일 경과) - 규칙 기반 사용")
+                return False
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return True
+
+
+def _save_ai_theme_cache(theme_names):
+    """AI 테마 결과를 캐시 파일에 저장"""
+    try:
+        with open(AI_THEME_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": TODAY, "themes": theme_names}, f, ensure_ascii=False)
+        log(f"  💾 AI 테마 캐시 저장: {AI_THEME_CACHE_FILE}")
+    except Exception as e:
+        log(f"  ⚠️ AI 테마 캐시 저장 실패: {e}")
+
+
+def detect_themes_with_ai(news_titles, theme_map=None):
+    """Groq AI로 핫 테마 선정 → 매핑 DB에서 종목 조회 (주 1회)"""
+    if not news_titles or not theme_map:
+        return None
+
+    available_themes = list(theme_map.keys())
+    themes_list_text = ", ".join(available_themes)
+    news_text = "\n".join(f"- {t}" for t in news_titles[:30])
+
+    prompt = f"""너는 국내 증시 테마 분석가다.
+
+## 목표:
+아래 뉴스 헤드라인을 분석하여 현재 증시에서 가장 주목받는 테마 상위 10개를 선정하라.
+종목은 선정하지 마라. 테마명만 선정하면 된다.
+
+## 오늘의 뉴스 헤드라인:
+{news_text}
+
+## 사용 가능한 테마 목록:
+{themes_list_text}
+
+## 출력 형식 (JSON):
+{{
+  "themes": [
+    {{"name": "테마명", "search_query": "테마명 주식"}},
+    {{"name": "테마명2", "search_query": "테마명2 주식"}}
+  ]
+}}
+
+## 규칙:
+1. 위 테마 목록에서만 선택. 목록에 없는 테마는 사용 금지
+2. 뉴스에서 가장 화제인 테마 우선
+3. search_query는 네이버 뉴스 검색용 키워드 (테마명 + "주식")
+4. 정확히 10개 선정
+5. 뉴스와 무관한 테마를 넣지 마라"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+
+        if resp.status_code != 200:
+            log(f"  ⚠️ Groq API 오류: {resp.status_code} - {resp.text[:200]}")
+            return None
+
+        result = resp.json()
+        content = result["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+
+        if isinstance(parsed, dict):
+            raw_themes = None
+            for key in parsed:
+                if isinstance(parsed[key], list):
+                    raw_themes = parsed[key]
+                    break
+            if raw_themes is None:
+                raw_themes = [parsed]
+        else:
+            raw_themes = parsed
+
+        validated = []
+        for theme in raw_themes:
+            if not isinstance(theme, dict) or "name" not in theme:
+                continue
+            theme_name = theme["name"].strip()
+            search_query = theme.get("search_query", theme_name + " 주식")
+
+            stocks = []
+            if theme_name in theme_map:
+                stocks = theme_map[theme_name][:10]
+            else:
+                for map_key in theme_map:
+                    if theme_name in map_key or map_key in theme_name:
+                        stocks = theme_map[map_key][:10]
+                        break
+
+            if len(stocks) >= 3:
+                validated.append({
+                    "name": theme_name,
+                    "search_query": search_query,
+                    "stocks": stocks[:10],
+                })
+
+        if validated:
+            total_stocks = sum(len(t["stocks"]) for t in validated)
+            log(f"  🤖 AI 테마 감지 완료: {len(validated)}개 테마, {total_stocks}개 종목")
+            for t in validated:
+                names = ", ".join(s["name"] for s in t["stocks"][:3])
+                log(f"     - {t['name']}: {names}...")
+            # 캐시 저장
+            _save_ai_theme_cache([t["name"] for t in validated])
+            return validated[:10]
+        else:
+            return None
+
+    except Exception as e:
+        log(f"  ⚠️ AI 테마 감지 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 신규 테마 자동 발굴 (Groq AI) — 일 1회
+# ─────────────────────────────────────────
+NEW_THEME_CACHE_FILE = "new_theme_cache.json"
+
+
+def _should_run_new_theme_discovery():
+    """캐시 파일을 확인하여 신규 테마 발굴을 실행할지 결정 (1일 경과 시 실행)"""
+    if not GROQ_API_KEY:
+        return False
+    try:
+        with open(NEW_THEME_CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        cached_date = cache.get("date", "")
+        if cached_date:
+            from datetime import datetime as _dt
+            diff = (_dt.strptime(TODAY, "%Y-%m-%d") - _dt.strptime(cached_date, "%Y-%m-%d")).days
+            if diff < 1:
+                log(f"  ℹ️ 신규 테마 캐시 유효 ({cached_date}, 오늘 이미 실행) - 발굴 스킵")
+                return False
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return True
+
+
+def _is_duplicate_theme(new_name, new_keywords, existing_themes):
+    """신규 테마가 기존 테마와 중복되는지 확인"""
+    new_name_lower = new_name.lower().replace(" ", "")
+
+    for existing_name, existing_kws in existing_themes.items():
+        existing_lower = existing_name.lower().replace(" ", "")
+
+        # 1) 이름 부분 매칭
+        if new_name_lower in existing_lower or existing_lower in new_name_lower:
+            return True
+
+        # 2) 키워드 겹침률 50% 이상
+        if new_keywords and existing_kws:
+            new_set = set(k.lower() for k in new_keywords)
+            existing_set = set(k.lower() for k in existing_kws)
+            overlap = len(new_set & existing_set)
+            if overlap > 0 and overlap / len(new_set) >= 0.5:
+                return True
+
+    return False
+
+
+def _match_stocks_for_new_theme(keywords, krx_data):
+    """신규 테마의 키워드로 KRX 데이터 + 기업개요 캐시에서 관련 종목 매칭"""
+    MIN_MARKET_CAP = 300_000_000_000  # 시총 3000억+
+    matched = {}
+
+    # 1) KRX 종목명 매칭
+    for code, d in krx_data.items():
+        if d.get("market_cap", 0) < MIN_MARKET_CAP:
+            continue
+        if code[-1] in ("5", "7", "8", "9") and "우" in d.get("name", ""):
+            continue
+        name = d.get("name", "")
+        for kw in keywords:
+            if kw in name:
+                matched[code] = {"code": code, "name": name, "market": d.get("market", "")}
+                break
+
+    # 2) 기업개요 캐시에서 키워드 검색
+    if os.path.exists(THEME_MAP_FILE):
+        try:
+            with open(THEME_MAP_FILE, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+            # theme_stock_map.json의 stocks에는 code → [theme list] 매핑이 있지만
+            # 기업개요 텍스트는 저장되지 않으므로, 기존 theme_to_stocks에서 종목 정보를 활용
+            # 대신 모든 테마 종목을 순회하며 종목명에 키워드 포함 여부 확인
+            all_stocks_in_map = set()
+            for theme_stocks in cache_data.get("theme_to_stocks", {}).values():
+                for s in theme_stocks:
+                    code = s.get("code", "")
+                    if code and code not in matched:
+                        all_stocks_in_map.add((code, s.get("name", ""), s.get("market", "")))
+
+            for code, name, market in all_stocks_in_map:
+                if code in matched:
+                    continue
+                if code in krx_data and krx_data[code].get("market_cap", 0) < MIN_MARKET_CAP:
+                    continue
+                for kw in keywords:
+                    if kw in name:
+                        matched[code] = {"code": code, "name": name, "market": market}
+                        break
+        except Exception:
+            pass
+
+    return list(matched.values())
+
+
+def discover_new_themes(news_titles, krx_data, theme_map):
+    """일 1회: AI로 기존 테마 목록에 없는 신규 트렌드 테마를 발굴하여 DB에 등록"""
+    if not _should_run_new_theme_discovery():
+        return
+
+    log("  🔍 신규 테마 자동 발굴 시작 (일 1회)...")
+
+    try:
+        existing_themes = list(NEWS_THEME_KEYWORDS.keys())
+        existing_list_text = ", ".join(existing_themes)
+        news_text = "\n".join(f"- {t}" for t in news_titles[:50])
+
+        prompt = f"""너는 국내 증시 테마 분석 전문가다.
+
+## 목표:
+아래 최신 뉴스 헤드라인을 분석하여, 현재 기존 테마 목록에 없는 **새로운 투자 테마**를 최대 5개 발굴하라.
+기존 테마를 반복하거나 변형하지 마라. 완전히 새로운 테마만 제안하라.
+
+## 오늘의 뉴스 헤드라인:
+{news_text}
+
+## 기존 테마 목록 (이 목록에 있는 테마는 제외):
+{existing_list_text}
+
+## 출력 형식 (JSON):
+{{
+  "new_themes": [
+    {{
+      "name": "테마명 (2~5글자, 간결하게)",
+      "keywords": ["키워드1", "키워드2", "키워드3", "키워드4", "키워드5"],
+      "reason": "이 테마가 주목받는 이유 (1문장)"
+    }}
+  ]
+}}
+
+## 규칙:
+1. 기존 테마 목록과 중복되는 테마 절대 금지 (유사 변형도 금지)
+2. 한국 증시와 관련된 투자 테마만 선정
+3. 테마당 검색용 키워드 최소 4개 이상 제시 (종목명, 기술명, 산업 용어 등)
+4. 뉴스에서 실제로 언급된 트렌드 기반으로만 선정
+5. 너무 넓은 테마(예: "경제", "정치") 금지 — 구체적 산업/기술 단위로
+6. 발굴할 테마가 없으면 빈 배열 반환: {{"new_themes": []}}
+7. 최대 5개까지만"""
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+
+        if resp.status_code != 200:
+            log(f"  ⚠️ 신규 테마 발굴 API 오류: {resp.status_code}")
+            return
+
+        result = resp.json()
+        content = result["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+
+        raw_themes = parsed.get("new_themes", [])
+        if not raw_themes:
+            log("  ℹ️ AI가 신규 테마 없음으로 판단 — 스킵")
+            # 캐시 저장 (빈 결과라도 7일간 재시도 방지)
+            try:
+                with open(NEW_THEME_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"date": TODAY, "discovered": []}, f, ensure_ascii=False)
+            except Exception:
+                pass
+            return
+
+        discovered = []
+        for theme in raw_themes[:5]:
+            if not isinstance(theme, dict):
+                continue
+            name = theme.get("name", "").strip()
+            keywords = theme.get("keywords", [])
+            reason = theme.get("reason", "")
+
+            if not name or not keywords or len(keywords) < 3:
+                log(f"     ❌ '{name}' 스킵: 이름 또는 키워드 부족")
+                continue
+
+            # 중복 체크
+            if _is_duplicate_theme(name, keywords, NEWS_THEME_KEYWORDS):
+                log(f"     ❌ '{name}' 스킵: 기존 테마와 중복")
+                continue
+
+            # 종목 매칭
+            matched_stocks = _match_stocks_for_new_theme(keywords, krx_data)
+            if len(matched_stocks) < 3:
+                log(f"     ❌ '{name}' 스킵: 매칭 종목 {len(matched_stocks)}개 (최소 3개 필요)")
+                continue
+
+            # ✅ 유효한 신규 테마
+            discovered.append({
+                "name": name,
+                "keywords": keywords,
+                "reason": reason,
+                "stocks": matched_stocks,
+            })
+
+        if not discovered:
+            log("  ℹ️ 유효한 신규 테마 없음 (중복/종목 부족)")
+            try:
+                with open(NEW_THEME_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"date": TODAY, "discovered": []}, f, ensure_ascii=False)
+            except Exception:
+                pass
+            return
+
+        # DB 등록 + 런타임 병합
+        for t in discovered:
+            name = t["name"]
+            keywords = t["keywords"]
+            stocks = t["stocks"]
+
+            # 1) NEWS_THEME_KEYWORDS에 런타임 병합
+            NEWS_THEME_KEYWORDS[name] = keywords
+
+            # 2) theme_map에 종목 추가 (mutable dict 직접 수정)
+            theme_map[name] = stocks
+
+            # 3) theme_keywords 테이블에 DB 등록
+            for kw in keywords:
+                try:
+                    supabase_request("POST", "theme_keywords", data=[{
+                        "theme": name,
+                        "keyword": kw,
+                        "enabled": True,
+                        "memo": f"AI 자동 발굴 ({TODAY})",
+                    }])
+                except Exception:
+                    pass  # 중복 키 등 무시
+
+            stock_names = ", ".join(s["name"] for s in stocks[:5])
+            log(f"     ✅ '{name}' 등록 완료 — 키워드 {len(keywords)}개, 종목 {len(stocks)}개 ({stock_names}...)")
+            log(f"        사유: {t['reason']}")
+
+        # 캐시 저장
+        try:
+            with open(NEW_THEME_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date": TODAY,
+                    "discovered": [t["name"] for t in discovered],
+                }, f, ensure_ascii=False)
+            log(f"  💾 신규 테마 캐시 저장: {NEW_THEME_CACHE_FILE}")
+        except Exception as e:
+            log(f"  ⚠️ 신규 테마 캐시 저장 실패: {e}")
+
+        log(f"  🎉 신규 테마 {len(discovered)}개 발굴 완료!")
+
+    except Exception as e:
+        log(f"  ⚠️ 신규 테마 발굴 실패 (기존 테마로 계속): {e}")
+
+
+def generate_stock_analysis(stocks, themes, sectors, news, krx_data):
+    """이슈 종목 TOP 5 심층 분석 생성 (Groq AI)"""
+    if not GROQ_API_KEY:
+        log("  ⚠️ GROQ_API_KEY 미설정 - 종목 분석 건너뜀")
+        return None
+
+    if not stocks:
+        log("  ⚠️ 이슈 종목 없음 - 종목 분석 건너뜀")
+        return None
+
+    top5 = stocks[:5]
+    log(f"  📊 종목 분석 생성 시작 (TOP {len(top5)}개)")
+
+    # 종목별 컨텍스트 구성
+    stock_contexts = []
+    theme_names = [t.get("name", "") for t in (themes or [])]
+    sector_names = {s.get("name", ""): s.get("change_pct", "0%") for s in (sectors or [])}
+
+    for s in top5:
+        code = s.get("code", "")
+        name = s.get("name", "")
+
+        # 소속 테마 찾기
+        stock_themes = []
+        for t in (themes or []):
+            ls = t.get("leading_stocks", "")
+            if code in ls or name in ls:
+                stock_themes.append(t.get("name", ""))
+
+        # 소속 섹터 찾기
+        stock_sector = ""
+        if krx_data and code in krx_data:
+            stock_sector = krx_data[code].get("display_sector", "")
+
+        # 관련 뉴스
+        related = []
+        try:
+            related = json.loads(s.get("related_news", "[]"))
+        except:
+            pass
+        news_titles = [n.get("title", "") for n in related[:3]]
+
+        # 투자자 수급 데이터
+        f_net = s.get("foreign_net", 0)
+        i_net = s.get("institution_net", 0)
+        ind_net = s.get("individual_net", 0)
+        f_ratio = s.get("foreign_ratio", 0)
+        investor_line = f"외국인 순매수: {f_net:+,}억원, 기관 순매수: {i_net:+,}억원, 개인 순매수: {ind_net:+,}억원, 외국인 보유비율: {f_ratio:.1f}%"
+
+        stock_contexts.append(
+            f"종목: {name} ({code})\n"
+            f"가격: ₩{s.get('price', '?')}, 등락률: {s.get('change_pct', '?')}, 거래대금: {s.get('volume', '?')}\n"
+            f"투자자 수급: {investor_line}\n"
+            f"이슈 사유: {s.get('reason', '?')}\n"
+            f"소속 테마: {', '.join(stock_themes) if stock_themes else '없음'}\n"
+            f"소속 섹터: {stock_sector or '미분류'} (섹터 등락: {sector_names.get(stock_sector, '?')})\n"
+            f"관련 뉴스: {chr(10).join(news_titles) if news_titles else '없음'}"
+        )
+
+    # 시장 맥락
+    market_ctx_parts = []
+    if sectors:
+        up_sectors = [s["name"] for s in sectors if s.get("trend") == "up"]
+        dn_sectors = [s["name"] for s in sectors if s.get("trend") == "down"]
+        if up_sectors:
+            market_ctx_parts.append(f"상승 섹터: {', '.join(up_sectors[:5])}")
+        if dn_sectors:
+            market_ctx_parts.append(f"하락 섹터: {', '.join(dn_sectors[:5])}")
+    if themes:
+        top_themes = [t["name"] for t in themes[:5]]
+        market_ctx_parts.append(f"인기 테마: {', '.join(top_themes)}")
+    market_ctx = " | ".join(market_ctx_parts)
+
+    prompt = f"""당신은 한국 주식시장 10년 경력 시니어 애널리스트입니다.
+오늘 이슈가 된 상위 종목들을 3축(재료·수급·모멘텀) 관점에서 심층 분석해주세요.
+
+[오늘 시장 맥락]
+{market_ctx}
+
+[분석 대상 종목]
+{"---".join(stock_contexts)}
+
+[분석 프레임워크 — 각 축별 300~500자씩 깊이 있게 분석]
+
+1. 재료(Catalyst) 분석:
+   - 이 종목이 오늘 이슈가 된 구체적 뉴스/이벤트/정책을 인용
+   - 해당 재료가 주가에 미치는 파급 경로를 2~3단계로 설명 (예: 정책발표 → 수주 기대 → 실적 상향)
+   - 재료의 수명 판단: 단기(1~3일 이벤트성) / 중기(1~4주 실적 반영) / 장기(1개월+ 구조적 변화)
+   - 과거 유사한 재료가 나왔을 때 주가 반응 패턴이 있다면 비교
+   - 시장에서 이미 반영된 부분 vs 아직 미반영된 부분 구분
+
+2. 수급(Flow) 분석:
+   - 외국인/기관/개인 순매수 데이터를 구체적으로 해석 (금액, 방향, 강도)
+   - 수급 주도 세력 식별: 누가 주도하고 있는가? 그 의미는?
+   - 외국인 매수라면 글로벌 자금 흐름과 연결, 기관 매수라면 연기금/투신/자사주 성격 구분
+   - 개인 매수 집중 시 과열 리스크, 개인 순매도 시 공포 매도 여부 판단
+   - 현재 수급 구조의 지속 가능성 평가
+
+3. 모멘텀(Momentum) 분석:
+   - 등락률 크기와 거래대금을 기반으로 상승/하락 추세의 강도 평가
+   - 상한가/하한가 여부, 연속 상승/하락 패턴 확인
+   - 과열 징후 (급등 후 차익실현 압력) 또는 추가 상승 여력 판단
+   - 동일 섹터·테마 내 다른 종목 대비 상대 강도 비교
+   - 향후 1~3일 가격 방향에 대한 구체적 견해
+
+[출력 규칙]
+- 한국어로 작성
+- 각 축별 300~500자, 종목당 총 900~1500자
+- 구체적 수치(금액, 퍼센트, 종목명)를 적극 활용
+- "관망" 같은 애매한 표현 금지. 명확한 판단 + 근거 제시
+- 재료/수급/모멘텀 강도를 각각 strong/moderate/weak로 판정
+- verdict(핵심 판단)는 100자 이내, 조건부 시나리오 포함 가능 (예: "A이면 B, 그렇지 않으면 C")
+- risk_note: 이 종목의 가장 큰 리스크 요인 한 줄
+
+JSON 형식:
+{{
+  "stocks": [
+    {{
+      "name": "종목명",
+      "code": "종목코드",
+      "price": "가격",
+      "change_pct": "등락률",
+      "catalyst_analysis": "재료 분석 본문 (300~500자)",
+      "catalyst_rating": "strong|moderate|weak",
+      "catalyst_lifecycle": "short|mid|long",
+      "supply_analysis": "수급 분석 본문 (300~500자)",
+      "supply_rating": "strong|moderate|weak",
+      "momentum_analysis": "모멘텀 분석 본문 (300~500자)",
+      "momentum_rating": "strong|moderate|weak",
+      "verdict": "핵심 판단 (100자 이내)",
+      "risk_note": "핵심 리스크 한 줄"
+    }}
+  ],
+  "market_context": "오늘 시장 전체 맥락 (200자 이내, 지수·섹터·테마 흐름 요약)",
+  "date": "{TODAY}"
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens": 8192,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=90,
+        )
+
+        if resp.status_code != 200:
+            log(f"  ⚠️ Groq 종목 분석 오류: {resp.status_code} - {resp.text[:200]}")
+            return None
+
+        result = resp.json()
+        content = result["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+
+        analyzed_stocks = parsed.get("stocks", [])
+        market_context = parsed.get("market_context", "")
+
+        if analyzed_stocks:
+            log(f"  🤖 종목 분석 생성 완료 ({len(analyzed_stocks)}종목)")
+            for a in analyzed_stocks:
+                log(f"     • {a.get('name', '?')} — {a.get('verdict', '')[:60]}")
+            return {
+                "date": TODAY,
+                "market_context": market_context,
+                "stocks": json.dumps(analyzed_stocks, ensure_ascii=False),
+            }
+        return None
+
+    except Exception as e:
+        log(f"  ⚠️ 종목 분석 생성 실패: {e}")
+        return None
+
+
+def generate_theme_analysis(themes, sectors, news, indices):
+    """인기 테마 TOP 10 심층 분석 생성 (Groq AI)"""
+    if not GROQ_API_KEY:
+        log("  ⚠️ GROQ_API_KEY 미설정 - 테마 분석 건너뜀")
+        return None
+
+    if not themes:
+        log("  ⚠️ 테마 데이터 없음 - 테마 분석 건너뜀")
+        return None
+
+    top10 = themes[:10]
+    log(f"  🔥 테마 심층 분석 시작 (TOP {len(top10)}개)")
+
+    # 테마별 컨텍스트 구성
+    theme_blocks = []
+    for t in top10:
+        name = t.get("name", "")
+        pct = t.get("change_pct", "0%")
+        up = t.get("up_count", 0)
+        dn = t.get("down_count", 0)
+        flat = t.get("flat_count", 0)
+        stocks = t.get("leading_stocks", "")
+
+        # 관련 뉴스 제목 추출
+        news_titles = []
+        nl = t.get("news_list")
+        if nl:
+            try:
+                parsed_nl = json.loads(nl) if isinstance(nl, str) else nl
+                news_titles = [n.get("title", "") for n in (parsed_nl or []) if n.get("title")]
+            except Exception:
+                pass
+        if not news_titles and t.get("related_news"):
+            news_titles = [t["related_news"]]
+
+        block = f"""[{name}] 등락률: {pct} | 상승 {up} · 보합 {flat} · 하락 {dn}
+대장주: {stocks}
+관련 뉴스: {' / '.join(news_titles[:5]) if news_titles else '없음'}"""
+        theme_blocks.append(block)
+
+    # 시장 맥락
+    market_parts = []
+    if indices:
+        for idx in indices:
+            nm = idx.get("name", "")
+            if nm in ["코스피", "코스닥", "USD/KRW"]:
+                market_parts.append(f"{nm} {idx.get('value','')} ({idx.get('change_pct','')})")
+    if sectors:
+        up_s = [s["name"] for s in sectors if s.get("trend") == "up"][:5]
+        dn_s = [s["name"] for s in sectors if s.get("trend") == "down"][:5]
+        if up_s:
+            market_parts.append(f"상승 섹터: {', '.join(up_s)}")
+        if dn_s:
+            market_parts.append(f"하락 섹터: {', '.join(dn_s)}")
+    market_ctx = " | ".join(market_parts)
+
+    prompt = f"""당신은 한국 주식시장 테마 전문 애널리스트입니다.
+오늘 인기 테마 TOP 10에 대해 각각 심층 분석을 작성해주세요.
+
+[오늘 시장 맥락]
+{market_ctx}
+
+[인기 테마 TOP 10]
+{"---".join(theme_blocks)}
+
+[분석 프레임워크]
+각 테마에 대해 아래 4가지를 자연스럽게 통합하여 서술:
+1. 촉발 요인: 오늘 이 테마가 부각된 구체적 원인 (정책 발표, 뉴스, 지정학, 실적, 글로벌 이벤트 등)
+2. 근본 배경: 표면적 뉴스 너머의 구조적·산업적 흐름 (글로벌 트렌드, 산업 사이클, 규제 변화 등)
+3. 수혜·리스크 종목: 대장주 중 가장 수혜를 받는 종목과 주의할 종목 구체적 언급
+4. 투자자 대응: 진입 타이밍, 주의할 리스크, 테마 지속성(단기 1~3일 / 중기 1~4주 / 장기 1개월+) 판단
+
+[출력 규칙]
+- 한국어로 작성
+- 각 테마 분석: 1000~2000자 (4개 항목을 자연스럽게 통합)
+- 항목 번호(1. 2. 3. 4.)를 붙여서 구분하되 자연스럽게 이어서 서술
+- "관망" 같은 애매한 표현 금지. 구체적 판단과 근거 제시
+- 숫자와 종목명을 적극 활용하여 구체적으로 서술
+- 뉴스를 인용할 때 정확하게 인용
+- outlook: 이 테마의 향후 전망 (positive=추가 상승, neutral=현 수준, negative=하락 전환 우려)
+
+JSON 형식:
+{{
+  "themes": [
+    {{
+      "theme_name": "테마명 (입력과 정확히 동일하게)",
+      "analysis": "4개 항목 통합 분석 본문",
+      "outlook": "positive|neutral|negative"
+    }}
+  ],
+  "date": "{TODAY}"
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+
+        if resp.status_code != 200:
+            log(f"  ⚠️ Groq 테마 분석 오류: {resp.status_code} - {resp.text[:200]}")
+            return None
+
+        result = resp.json()
+        content = result["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+
+        analyzed = parsed.get("themes", [])
+        if analyzed:
+            log(f"  🔥 테마 분석 생성 완료 ({len(analyzed)}개)")
+            rows = []
+            for a in analyzed:
+                tn = a.get("theme_name", "")
+                log(f"     • {tn} — {a.get('outlook', 'neutral')}")
+                rows.append({
+                    "date": TODAY,
+                    "theme_name": tn,
+                    "analysis": a.get("analysis", ""),
+                    "outlook": a.get("outlook", "neutral"),
+                })
+            return rows
+        return None
+
+    except Exception as e:
+        log(f"  ⚠️ 테마 분석 생성 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 1. 뉴스 수집 (네이버 검색 API)
+# ─────────────────────────────────────────
+def crawl_news():
+    """네이버 검색 API로 증시 뉴스 수집"""
+    log("📰 뉴스 크롤링 시작...")
+
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        log("  ⚠️ NAVER_CLIENT_ID/SECRET 미설정 - 뉴스 수집 건너뜀")
+        return []
+
+    news_list = []
+    seen_titles = set()
+    queries = ["증시", "주식시장", "코스피"]
+
+    for query in queries:
+        if len(news_list) >= 15:
+            break
+        try:
+            url = "https://openapi.naver.com/v1/search/news.json"
+            params = {"query": query, "display": 15, "sort": "date"}
+            headers = {
+                "X-Naver-Client-Id": NAVER_CLIENT_ID,
+                "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+            }
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            data = resp.json()
+
+            for item in data.get("items", []):
+                title = html.unescape(re.sub(r'<[^>]+>', '', item.get("title", ""))).strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+
+                description = html.unescape(re.sub(r'<[^>]+>', '', item.get("description", ""))).strip()
+
+                source_name = "뉴스"
+                try:
+                    domain = urllib.parse.urlparse(item.get("originallink", "")).netloc
+                    source_name = domain.replace("www.", "").split(".")[0]
+                except:
+                    pass
+
+                time_ago = _calc_time_ago(item.get("pubDate", ""))
+
+                news_list.append({
+                    "title": title,
+                    "source": source_name or "뉴스",
+                    "time_ago": time_ago,
+                    "category": classify_news_category(title),
+                    "sentiment": analyze_sentiment(title),
+                    "summary": description[:500] if description else title,
+                    "url": item.get("link", ""),
+                    "date": TODAY,
+                })
+
+                if len(news_list) >= 15:
+                    break
+        except Exception as e:
+            log(f"  ⚠️ 뉴스 검색 실패 ({query}): {e}")
+
+    log(f"  ✅ 뉴스 {len(news_list)}개 수집 완료")
+    return news_list
+
+
+def fetch_stock_news(stock_name, max_count=3):
+    """특정 종목의 관련 뉴스를 네이버 검색 API로 조회"""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return []
+    try:
+        url = "https://openapi.naver.com/v1/search/news.json"
+        params = {"query": f"{stock_name} 주가", "display": 5, "sort": "date"}
+        headers = {
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=5)
+        data = resp.json()
+        results = []
+        for item in data.get("items", []):
+            title = html.unescape(re.sub(r'<[^>]+>', '', item.get("title", ""))).strip()
+            if not title:
+                continue
+            source_name = "뉴스"
+            try:
+                domain = urllib.parse.urlparse(item.get("originallink", "")).netloc
+                source_name = domain.replace("www.", "").split(".")[0]
+            except:
+                pass
+            results.append({
+                "title": title,
+                "source": source_name or "뉴스",
+                "time_ago": _calc_time_ago(item.get("pubDate", "")),
+                "url": item.get("link", ""),
+            })
+            if len(results) >= max_count:
+                break
+        return results
+    except Exception as e:
+        log(f"  ⚠️ {stock_name} 관련 뉴스 조회 실패: {e}")
+        return []
+
+
+# ─────────────────────────────────────────
+# 2. 이슈 종목 (KRX 거래대금 상위)
+# ─────────────────────────────────────────
+def crawl_issue_stocks(krx_data, themes=None, sectors=None, news=None, stock_themes=None):
+    """복합 점수 기반 이슈 종목 선정 (거래대금+등락률+테마+뉴스+섹터)
+
+    stock_themes: build_theme_stock_map가 반환한 종목별 테마 분류 (태그 우선순위에 사용)
+    """
+    log("📈 이슈 종목 크롤링 시작...")
+
+    # ── 1단계: 후보 필터링 (거래대금 1000억 이상, ETF 제외) ──
+    MIN_TRADING_VALUE = 100_000_000_000  # 1000억 원
+    LIMIT_PCT = 29.5  # 상한가/하한가 기준 (±29.5% 이상)
+    candidates = []
+    for code, d in krx_data.items():
+        if d["volume"] == 0 or d["price"] == 0:
+            continue
+        if is_etf_etn(d["name"]):
+            continue
+        if d["trading_value"] >= MIN_TRADING_VALUE:
+            candidates.append(d)
+
+    if not candidates:
+        # fallback: 거래대금 상위 50개
+        all_stocks = [d for d in krx_data.values() if d["volume"] > 0 and d["price"] > 0 and not is_etf_etn(d["name"])]
+        all_stocks.sort(key=lambda x: x["trading_value"], reverse=True)
+        candidates = all_stocks[:50]
+
+    limit_count = sum(1 for d in candidates if abs(d["change_pct"]) >= LIMIT_PCT)
+    log(f"  📋 후보 종목: {len(candidates)}개 (거래대금 1000억+, 상한가/하한가 {limit_count}개)")
+
+    # ── 2단계: 보조 데이터 구축 ──
+    # 인기 테마 소속 종목 코드 → 테마명 매핑
+    theme_stock_codes = set()
+    stock_theme_names = {}  # code → [테마명, ...]
+    if themes:
+        for t in themes:
+            tname = t.get("name", "")
+            ls = t.get("leading_stocks", "")
+            for part in ls.split(","):
+                parts = part.strip().split(":")
+                if len(parts) >= 2 and parts[1].strip().isdigit():
+                    code = parts[1].strip()
+                    theme_stock_codes.add(code)
+                    if code not in stock_theme_names:
+                        stock_theme_names[code] = []
+                    if tname and tname not in stock_theme_names[code]:
+                        stock_theme_names[code].append(tname)
+
+    # 상승 섹터 이름 세트
+    rising_sectors = set()
+    if sectors:
+        for s in sectors:
+            if s.get("trend") == "up":
+                rising_sectors.add(s.get("name", ""))
+
+    # 뉴스 제목에서 종목명 언급 횟수
+    news_mention_count = {}
+    if news:
+        news_titles = " ".join(n.get("title", "") for n in news)
+        for d in candidates:
+            name = d["name"]
+            # 2글자 이상 종목명만 매칭 (오탐 방지)
+            if len(name) >= 2 and name in news_titles:
+                news_mention_count[d["code"]] = news_titles.count(name)
+
+    # ── 3단계: 종합 점수 계산 ──
+    # 거래대금 순위 점수 (정규화)
+    candidates.sort(key=lambda x: x["trading_value"], reverse=True)
+    max_tv_rank = len(candidates)
+    tv_rank_map = {d["code"]: i for i, d in enumerate(candidates)}
+
+    # 등락률 절대값 순위
+    candidates_by_change = sorted(candidates, key=lambda x: abs(x["change_pct"]), reverse=True)
+    change_rank_map = {d["code"]: i for i, d in enumerate(candidates_by_change)}
+
+    scored = []
+    for d in candidates:
+        code = d["code"]
+        n = max_tv_rank if max_tv_rank > 0 else 1
+
+        # 거래대금 점수 (50점) — 순위가 높을수록 점수 높음
+        tv_score = (1 - tv_rank_map[code] / n) * 50
+
+        # 등락률 점수 (10점) — 절대값 순위
+        change_score = (1 - change_rank_map[code] / n) * 10
+
+        # 인기 테마 소속 (10점) — 소속이면 10점
+        theme_score = 10 if code in theme_stock_codes else 0
+
+        # 뉴스 언급 (10점) — 언급 횟수에 따라
+        mentions = news_mention_count.get(code, 0)
+        news_score = min(mentions * 5, 10)  # 1회=5점, 2회+=10점
+
+        # 상승 섹터 소속 (10점)
+        sector_score = 10 if d.get("display_sector", "") in rising_sectors else 0
+
+        # 상한가/하한가 보너스 (10점) — 시총 3000억+ 조건
+        limit_bonus = 0
+        if abs(d["change_pct"]) >= LIMIT_PCT and d.get("market_cap", 0) >= 300_000_000_000:
+            limit_bonus = 10
+
+        total = tv_score + change_score + theme_score + news_score + sector_score + limit_bonus
+
+        # 선정 사유 생성
+        reasons = []
+        cp = d["change_pct"]
+        if abs(cp) >= LIMIT_PCT:
+            reasons.append("상한가" if cp > 0 else "하한가")
+        if theme_score > 0:
+            reasons.append("인기테마")
+        if news_score > 0:
+            reasons.append("뉴스언급")
+        if abs(cp) < LIMIT_PCT and change_score >= 20:
+            reasons.append("급등" if cp > 0 else "급락")
+        if tv_score >= 20:
+            reasons.append("거래폭발")
+        if sector_score > 0:
+            reasons.append("상승섹터")
+        reason_str = " · ".join(reasons) if reasons else "거래대금 상위"
+
+        scored.append((total, d, reason_str))
+
+    # ── 4단계: 랭킹 ──
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    stocks = []
+    for rank_idx, (score, d, reason_str) in enumerate(scored[:15], 1):
+        cp = d["change_pct"]
+        if cp > 0.005:
+            trend, pct_str = "up", f"+{cp:.2f}%"
+        elif cp < -0.005:
+            trend, pct_str = "down", f"{cp:.2f}%"
+        else:
+            trend, pct_str = "flat", "0.00%"
+
+        try:
+            price_formatted = f"{d['price']:,}"
+        except:
+            price_formatted = str(d["price"])
+
+        trading_value_eok = d["trading_value"] / 100_000_000
+        volume_str = format_trading_value(str(int(trading_value_eok)))
+
+        stocks.append({
+            "rank": rank_idx,
+            "name": d["name"],
+            "code": d["code"],
+            "price": price_formatted,
+            "change_pct": pct_str,
+            "volume": volume_str,
+            "reason": reason_str,
+            "tags": classify_stock_tags(
+                d["name"],
+                d.get("display_sector", ""),
+                stock_theme_names.get(d["code"]),
+                theme_map_themes=(stock_themes.get(d["code"]) if stock_themes else None),
+            ),
+            "trend": trend,
+            "date": TODAY,
+        })
+
+    # ── 5단계: 종목별 관련 뉴스 수집 ──
+    log("  📰 종목별 관련 뉴스 수집 중...")
+    for s in stocks:
+        name = s["name"]
+        matched = []
+
+        # 1) 기존 뉴스 목록에서 매칭 (제목 또는 요약에 종목명 포함)
+        if news:
+            for n in news:
+                title_text = n.get("title", "")
+                summary_text = n.get("summary", "")
+                if len(name) >= 2 and name in (title_text + " " + summary_text):
+                    matched.append({
+                        "title": n["title"],
+                        "source": n.get("source", "뉴스"),
+                        "time_ago": n.get("time_ago", ""),
+                        "url": n.get("url", ""),
+                    })
+                    if len(matched) >= 3:
+                        break
+
+        # 2) 부족하면 네이버 뉴스 API로 종목 전용 검색
+        if len(matched) < 3:
+            extra = fetch_stock_news(name, 3 - len(matched))
+            matched.extend(extra)
+
+        s["related_news"] = json.dumps(matched[:5], ensure_ascii=False)
+
+    # ── 6단계: 투자자별 순매수 데이터 수집 (외국인/기관/개인) ──
+    log("  💰 투자자별 순매수 데이터 수집 중...")
+    for s in stocks:
+        code = s["code"]
+        price_raw = int(str(s["price"]).replace(",", "").replace("₩", ""))
+        trend_data = fetch_investor_trend(code, price_raw)
+        if trend_data:
+            s["foreign_net"] = trend_data["foreign_net"]
+            s["institution_net"] = trend_data["institution_net"]
+            s["individual_net"] = trend_data["individual_net"]
+            s["foreign_ratio"] = trend_data["foreign_ratio"]
+        else:
+            s["foreign_net"] = 0
+            s["institution_net"] = 0
+            s["individual_net"] = 0
+            s["foreign_ratio"] = 0.0
+    investor_ok = sum(1 for s in stocks if s.get("foreign_net", 0) != 0 or s.get("institution_net", 0) != 0)
+    log(f"  ✅ 투자자 데이터 {investor_ok}/{len(stocks)}개 종목 수집 완료")
+
+    log(f"  ✅ 이슈 종목 {len(stocks)}개 선정 (복합 점수 기반)")
+    for s in stocks[:5]:
+        news_cnt = len(json.loads(s["related_news"])) if s.get("related_news") else 0
+        f_net = s.get("foreign_net", 0)
+        i_net = s.get("institution_net", 0)
+        log(f"     {s['rank']}. {s['name']} ({s['change_pct']}) — {s['reason']} [뉴스 {news_cnt}건, 외인 {f_net:+,}억, 기관 {i_net:+,}억]")
+    return stocks
+
+
+# ─────────────────────────────────────────
+# 2-1. 일별 종가 누적 + 과대 낙폭 종목 (MA20 이격 -20% 이하)
+# ─────────────────────────────────────────
+OVERSOLD_MIN_MARKET_CAP = 300_000_000_000  # 시총 3000억 원
+OVERSOLD_THRESHOLD = -20.0                  # MA20 대비 -20% 이하
+OVERSOLD_MA_WINDOW = 20                     # 이동평균 일수
+OVERSOLD_HISTORY_DAYS = 75                  # daily_prices 보존 기간 (최근 20거래일 이력 검사에 40거래일 필요)
+OVERSOLD_TRACK_COOLDOWN = 20                # 성과 추적: 연속 이탈 시작일(어제) 전 N거래일 안에 MA20 -20% 이하였던 종목은 편입 안 함
+OVERSOLD_MIN_TRADING_VALUE = 100_000_000_000  # 당일 거래대금 1,000억 원 이상
+
+# ── 과대 낙폭 성과 추적 (oversold_track) ──
+OVERSOLD_TRACK_TAKE_PROFIT = 10.0           # 종가 수익률 +10% 이상 → 익절 마감
+OVERSOLD_TRACK_STOP_LOSS = -10.0            # 종가 수익률 -10% 이하 → 손절 마감
+OVERSOLD_TRACK_KEEP_DAYS = 365              # 성과 기록 보존 기간
+
+# ── 주도주 배팅 성과 추적 (leader_track) ──
+LEADER_MIN_CHANGE = 10.0                    # 동반 상승 인정: 당일 +10% 이상
+LEADER_MIN_TRADING_VALUE = 100_000_000_000  # 동반 상승 인정: 거래대금 1,000억 이상
+LEADER_MIN_THEME_STOCKS = 3                 # 주도 테마: 위 조건 종목이 대장 포함 3개 이상
+LEADER_MAX_PICKS = 3                        # 하루 최대 편입 (강한 테마 순, 테마당 대장 1종목)
+LEADER_TRACK_EXIT_MA = 10                   # 종가가 10일 이동평균선 아래로 내려가면 매도 (익절·손절선 없음)
+LEADER_TRACK_KEEP_DAYS = 365
+
+# ── 급등주 급락 매수 성과 추적 (pullback_track) ──
+PULLBACK_MIN_CHANGE = 10.0                    # 신호: 당일 +10% 이상
+PULLBACK_MIN_TRADING_VALUE = 300_000_000_000  # 신호: 거래대금 3,000억 이상
+PULLBACK_WATCH_DAYS = 20                      # 급등일 이후 20거래일 안에 시가 아래로 오면 매수
+PULLBACK_TAKE_PROFIT = 10.0
+PULLBACK_STOP_LOSS = -10.0
+PULLBACK_KEEP_DAYS = 365
+
+
+def save_daily_close(krx_data):
+    """close 모드에서 시총 3000억+ 종목의 당일 종가를 daily_prices에 누적 저장.
+
+    같은 (code, date)가 이미 있으면 PK 충돌이 나므로 먼저 DELETE 후 INSERT.
+    """
+    if not krx_data:
+        return 0
+
+    rows = []
+    for d in krx_data.values():
+        if d.get("market_cap", 0) < OVERSOLD_MIN_MARKET_CAP:
+            continue
+        if is_etf_etn(d["name"]):
+            continue
+        if d.get("price", 0) <= 0:
+            continue
+        rows.append({
+            "code": d["code"],
+            "date": TODAY,
+            "close": float(d["price"]),
+            "trading_value": int(d.get("trading_value", 0)),
+            "market_cap": int(d.get("market_cap", 0)),
+        })
+
+    if not rows:
+        log("  ⚠️ 저장할 일봉 데이터 없음")
+        return 0
+
+    # 오늘 날짜 데이터 선제거 (재실행 안전)
+    supabase_request("DELETE", "daily_prices", params={"date": f"eq.{TODAY}"})
+    supabase_request("POST", "daily_prices", data=rows)
+    log(f"  📅 일별 종가 {len(rows)}개 종목 저장 ✅")
+    return len(rows)
+
+
+_NAVER_CHART_RE = re.compile(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\|(\d+)"')
+
+
+def _fetch_naver_daily(symbol, count=40):
+    """네이버 차트 일봉 → [(YYYY-MM-DD, 종가, 거래량)] 날짜 오름차순. 실패 시 []."""
+    for attempt in range(3):
+        try:
+            r = requests.get("https://fchart.stock.naver.com/sise.nhn",
+                             params={"symbol": symbol, "timeframe": "day", "count": count, "requestType": 0},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                time.sleep(1 + attempt)
+                continue
+            out = []
+            for m in _NAVER_CHART_RE.finditer(r.text):
+                d, _o, _h, _l, c, v = m.groups()
+                if float(c) > 0:
+                    out.append((f"{d[:4]}-{d[4:6]}-{d[6:]}", float(c), float(v)))
+            return out
+        except Exception:
+            time.sleep(1 + attempt)
+    return []
+
+
+def repair_daily_price_gaps(krx_data, lookback=45):
+    """daily_prices에 빠진 거래일(크롤링이 멈췄던 날)을 네이버 일봉으로 채운다.
+
+    MA20·10일선이 공백 때문에 몇 주 전 가격으로 계산되는 문제를 막기 위함.
+    거래일 기준 = 네이버 코스피 차트. 대표 종목(삼성전자)에 없는 날짜를 '빠진 날'로 본다.
+    """
+    ref = [d for d, _c, _v in _fetch_naver_daily("KOSPI", lookback + 5) if d < TODAY][-lookback:]
+    if not ref:
+        log("  ⚠️ 거래일 기준(코스피 차트) 조회 실패 — 일봉 공백 검사 건너뜀")
+        return 0
+    have = {r["date"] for r in (supabase_request("GET", "daily_prices", params={
+        "code": "eq.005930", "date": f"gte.{ref[0]}", "select": "date"}) or [])}
+    missing = [d for d in ref if d not in have]
+    if not missing:
+        return 0
+    log(f"  🩹 daily_prices 빠진 거래일 {len(missing)}일 ({missing[0]} ~ {missing[-1]}) → 네이버 일봉으로 채움")
+
+    miss_set = set(missing)
+    rows = []
+    targets = [d for d in krx_data.values()
+               if d.get("market_cap", 0) >= OVERSOLD_MIN_MARKET_CAP and not is_etf_etn(d["name"])]
+    for i, d in enumerate(targets):
+        for day, close, vol in _fetch_naver_daily(d["code"], lookback + 10):
+            if day in miss_set:
+                rows.append({"code": d["code"], "date": day, "close": close,
+                             "trading_value": int(close * vol),          # 근사 (종가×거래량)
+                             "market_cap": int(d.get("market_cap", 0))})  # 근사 (현재 시총)
+        if i % 20 == 19:
+            time.sleep(0.2)
+    if not rows:
+        log("  ⚠️ 채울 일봉을 가져오지 못함")
+        return 0
+    supabase_request("DELETE", "daily_prices", params={"date": f"in.({','.join(missing)})"})
+    for i in range(0, len(rows), 1000):
+        supabase_request("POST", "daily_prices", data=rows[i:i + 1000])
+    log(f"  🩹 일봉 {len(rows)}행 보충 완료 ({len(targets)}종목)")
+    return len(rows)
+
+
+# 성과 추적 제외용: {종목코드: 연속 이탈 시작일 전 20거래일 안에 MA20 -20% 이하였던 가장 최근 날짜}
+_OVERSOLD_RECENT = {}
+# 성과 추적 편입 조건: 전 거래일에도 과대 낙폭 조건(MA20 -20% · 하락/보합 · 거래대금 1,000억+)이었던 종목
+_OVERSOLD_PREV = set()
+
+
+def _prev_day_oversold(closes, dates, tvs):
+    """전 거래일(오늘 이전 가장 최근 일봉)이 과대 낙폭 조건이었나. closes/dates/tvs 는 최신순."""
+    prior = [(dt, c, tv) for dt, c, tv in zip(dates, closes, tvs) if dt < TODAY]
+    if len(prior) < OVERSOLD_MA_WINDOW + 1:
+        return False
+    pc = [c for _d, c, _t in prior]
+    ma = sum(pc[:OVERSOLD_MA_WINDOW]) / OVERSOLD_MA_WINDOW
+    if ma <= 0 or pc[1] <= 0:
+        return False
+    return ((pc[0] - ma) / ma * 100.0 <= OVERSOLD_THRESHOLD
+            and pc[0] <= pc[1]
+            and (prior[0][2] or 0) >= OVERSOLD_MIN_TRADING_VALUE)
+
+
+def _recent_oversold_day(closes, dates):
+    """연속 이탈 시작일(전 거래일) 이전 OVERSOLD_TRACK_COOLDOWN 거래일 중
+    종가가 그날 MA20 대비 -20% 이하였던 가장 최근 날짜.
+
+    closes/dates 는 최신순. 오늘·전 거래일은 빼고 본다 (어제→오늘 2일 연속은 편입 조건).
+    MA20을 구할 종가가 모자란 날은 검사하지 않는다.
+    """
+    prior = [(dt, c) for dt, c in zip(dates, closes) if dt < TODAY]
+    pc = [c for _dt, c in prior]
+    for k in range(1, min(OVERSOLD_TRACK_COOLDOWN + 1, len(prior))):
+        win = pc[k:k + OVERSOLD_MA_WINDOW]
+        if len(win) < OVERSOLD_MA_WINDOW:
+            break
+        ma = sum(win) / OVERSOLD_MA_WINDOW
+        if ma > 0 and (pc[k] - ma) / ma * 100.0 <= OVERSOLD_THRESHOLD:
+            return prior[k][0]
+    return None
+
+
+def crawl_oversold_stocks(krx_data):
+    """MA20 대비 -20% 이하 낙폭 종목을 거래대금 순으로 산출.
+
+    1) daily_prices에서 최근 75일치 가져옴 (모든 종목 한 번에)
+    2) 종목별로 최근 20개 종가 평균 계산 → 현재가와 비교
+    3) (price - ma20) / ma20 * 100 <= -20% AND 시총 3000억+ AND 거래대금 1000억+ AND 데이터 충분(>=20개)
+    4) 거래대금 내림차순 정렬
+    """
+    log("📉 과대 낙폭 종목 산출 시작...")
+    _OVERSOLD_RECENT.clear()
+    _OVERSOLD_PREV.clear()
+
+    # daily_prices에서 최근 60일 데이터 fetch (페이지네이션)
+    cutoff = (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=OVERSOLD_HISTORY_DAYS)).strftime("%Y-%m-%d")
+    all_rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "date": f"gte.{cutoff}",
+            "select": "code,date,close,trading_value",
+            "order": "code.asc,date.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        batch = supabase_request("GET", "daily_prices", params=params)
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    if not all_rows:
+        log("  ⚠️ daily_prices 데이터 없음 — 백필 필요")
+        return []
+
+    # 종목별 최근 N일 종가 모음
+    by_code, dates_by_code, tv_by_code = {}, {}, {}
+    for r in all_rows:
+        c = r["code"]
+        by_code.setdefault(c, []).append(float(r["close"]))
+        dates_by_code.setdefault(c, []).append(r["date"])
+        tv_by_code.setdefault(c, []).append(float(r.get("trading_value") or 0))
+    # 20번째 종가가 이보다 오래되면 중간에 빠진 날이 있다는 뜻 → 계산하지 않음
+    # (20거래일 ≈ 달력 28일, 명절 연휴 여유 포함 40일)
+    stale_cut = (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=40)).strftime("%Y-%m-%d")
+    stale_skip = 0
+
+    # 후보 필터링 + MA20 계산
+    candidates = []
+    for code, d in krx_data.items():
+        if d.get("market_cap", 0) < OVERSOLD_MIN_MARKET_CAP:
+            continue
+        if is_etf_etn(d["name"]):
+            continue
+        price = d.get("price", 0)
+        if price <= 0:
+            continue
+        # 당일 상승 종목 제외 (낙폭 종목 탭이므로 하락/보합만 노출)
+        if d.get("change_pct", 0) > 0:
+            continue
+        # 거래대금 1,000억 미만 제외 (엔벨로프 20 하단 이탈 + 대량 거래 종목만)
+        if d.get("trading_value", 0) < OVERSOLD_MIN_TRADING_VALUE:
+            continue
+        closes = by_code.get(code, [])
+        # 오늘 종가는 by_code에 이미 들어있을 수 있음(save_daily_close 후 호출) → MA20 모집단으로 그대로 사용
+        if len(closes) < OVERSOLD_MA_WINDOW:
+            continue
+        if dates_by_code[code][OVERSOLD_MA_WINDOW - 1] < stale_cut:
+            stale_skip += 1
+            continue
+        ma20 = sum(closes[:OVERSOLD_MA_WINDOW]) / OVERSOLD_MA_WINDOW
+        if ma20 <= 0:
+            continue
+        deviation = (price - ma20) / ma20 * 100.0
+        if deviation <= OVERSOLD_THRESHOLD:
+            candidates.append((d, ma20, deviation))
+            hit = _recent_oversold_day(closes, dates_by_code[code])
+            if hit:
+                _OVERSOLD_RECENT[code] = hit
+            if _prev_day_oversold(closes, dates_by_code[code], tv_by_code[code]):
+                _OVERSOLD_PREV.add(code)
+
+    if stale_skip:
+        log(f"  ⚠️ 일봉 공백으로 MA20 계산 제외 {stale_skip}종목 (daily_prices 빠진 날 확인 필요)")
+
+    # 거래대금 내림차순 정렬
+    candidates.sort(key=lambda x: x[0].get("trading_value", 0), reverse=True)
+
+    gen_time = datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
+    result = []
+    for rank_idx, (d, ma20, deviation) in enumerate(candidates, 1):
+        result.append({
+            "date": TODAY,
+            "rank": rank_idx,
+            "code": d["code"],
+            "name": d["name"],
+            "price": float(d["price"]),
+            "ma20": round(ma20, 2),
+            "deviation": round(deviation, 2),
+            "change_pct": float(d.get("change_pct", 0)),
+            "trading_value": int(d.get("trading_value", 0)),
+            "market_cap": int(d.get("market_cap", 0)),
+            "market": d.get("market", ""),
+            "display_sector": d.get("display_sector", ""),
+            "tags": classify_stock_tags(d["name"], d.get("display_sector", "")),
+            "generated_time": gen_time,
+        })
+
+    log(f"  ✅ 과대 낙폭 {len(result)}개 종목 (MA20 대비 -20% 이하, 시총 3000억+, 거래대금 1000억+)")
+    for s in result[:5]:
+        log(f"     {s['rank']}. {s['name']} {s['deviation']:+.2f}% (현재 {s['price']:,.0f} vs MA20 {s['ma20']:,.0f})")
+    return result
+
+
+# ═════════════════════════════════════════════════════════════
+# 2-2. 재료 포착 TOP 10  (이슈 종목 탭)
+#
+#   목적: '좋은 종목'이 아니라
+#         '좋은 재료가 발생했는데 아직 주가에 충분히 반영되지 않은 종목'을 찾는다.
+#
+#   100점 = 뉴스 질/신뢰도 25 + 기업가치 영향 25 + 주가 미반영 20
+#           + 거래대금 8 + 수급 7 + 향후 추가 모멘텀 15
+#
+#   섹터 중립: 특정 섹터를 우대하거나 배제하지 않는다.
+# ═════════════════════════════════════════════════════════════
+
+CATALYST_MIN_MARKET_CAP = 300_000_000_000   # 시총 3000억 이상만
+CATALYST_LOOKBACK_DAYS = 5                  # 재료 탐색 범위 (최근 1~5일)
+CATALYST_TOP_N = 10
+CATALYST_NEWS_FETCH_LIMIT = 140             # 뉴스 API를 돌릴 최대 후보 수
+CATALYST_FLOW_FETCH_LIMIT = 30              # 투자자 수급을 조회할 상위 후보 수
+CATALYST_PRICE_HISTORY_DAYS = 60            # daily_prices 조회 범위 (캘린더일)
+CATALYST_MIN_TRADING_VALUE = 30_000_000_000  # 거래급증 후보 최소 거래대금 (300억)
+
+CATALYST_KEEP_DAYS = 365                    # catalyst_stocks 보존 기간
+
+
+# ── DART 공시명 → (재료 유형, 신뢰도 25점 만점, 지속성 15점 만점) ──
+#    앞에서부터 먼저 매칭되는 항목이 채택되므로 구체적인 것을 위에 둔다.
+DART_MATERIAL_TYPES = [
+    ("공급계약",                 "공급계약",     25, 12),
+    ("단일판매",                 "공급계약",     25, 12),
+    ("수주",                     "수주",         24, 12),
+    ("품목허가",                 "인허가",       25, 15),
+    ("임상시험결과",             "임상",         24, 14),
+    ("임상시험계획",             "임상",         20, 14),
+    ("기술이전",                 "기술이전",     24, 14),
+    ("라이선스",                 "기술이전",     24, 14),
+    ("회사합병",                 "M&A",          24, 14),
+    ("영업양수",                 "M&A",          22, 13),
+    ("주식교환",                 "M&A",          20, 12),
+    ("타법인주식",               "지분투자",     22, 13),
+    ("신규시설투자",             "설비투자",     23, 14),
+    ("유형자산",                 "설비투자",     18, 12),
+    ("특허권",                   "기술",         16, 10),
+    ("국책과제",                 "정부프로젝트", 18, 11),
+    ("정부과제",                 "정부프로젝트", 18, 11),
+    ("투자판단관련주요경영사항", "주요경영사항", 20, 10),
+    ("매출액또는손익구조",       "실적변동",     21, 11),
+    ("자기주식취득",             "자사주",       16,  9),
+    ("유상증자",                 "자금조달",     12,  5),
+    ("전환사채",                 "자금조달",      9,  4),
+    ("신주인수권부사채",         "자금조달",      9,  4),
+]
+
+# ── 뉴스 제목 → (재료 유형, 신뢰도 12점 만점, 지속성 15점 만점) ──
+#    DART 공시가 없을 때만 쓰이는 보조 판정. 공시보다 신뢰도 상한이 낮다.
+NEWS_MATERIAL_KEYWORDS = [
+    (("독점 공급", "독점공급", "단독 공급", "단독공급"), "독점공급",     12, 12),
+    (("FDA 승인", "품목허가", "시판허가", "패스트트랙", "희귀의약품", "조건부 허가"), "인허가", 12, 14),
+    (("기술이전", "기술 이전", "기술수출", "기술 수출", "라이선스 아웃", "라이선스아웃"), "기술이전", 12, 13),
+    (("임상 3상", "임상3상", "임상 2상", "임상2상", "톱라인", "임상 결과"), "임상", 11, 13),
+    (("공급계약", "공급 계약", "납품계약", "납품 계약"), "공급계약",     12, 11),
+    (("대규모 수주", "신규 수주", "수주 계약", "수주계약", "낙찰", "수주"), "수주", 12, 11),
+    (("증설", "설비투자", "설비 투자", "공장 신설", "생산능력 확대"), "설비투자", 11, 12),
+    (("경영권", "인수합병", "합병 결정", "지분 인수", "지분인수"), "M&A", 10, 11),
+    (("전략적 투자", "지분 투자", "지분투자", "투자 유치", "투자유치"), "지분투자", 10, 10),
+    (("국책과제", "정부과제", "실증사업", "공공 프로젝트", "국가과제"), "정부프로젝트", 10, 10),
+    (("수출 계약", "현지법인", "해외 진출", "해외진출", "해외 수주"), "해외진출", 11, 11),
+    (("공동개발", "공동 개발", "협력 계약", "업무협약", "MOU"), "협력",   8,  8),
+]
+
+# ── 원출처 신뢰도 가중 (네이버 뉴스 도메인 기준) ──
+NEWS_SOURCE_TIER = {
+    "hankyung": 1.0, "mk": 1.0, "sedaily": 1.0, "fnnews": 1.0, "edaily": 1.0,
+    "mt": 1.0, "thebell": 1.0, "yna": 1.0, "yonhapnewstv": 0.95, "etnews": 0.95,
+    "news1": 0.95, "newsis": 0.95, "biz": 0.9, "chosun": 0.9, "joongang": 0.9,
+    "donga": 0.9, "heraldcorp": 0.9, "asiae": 0.9, "kbs": 0.9, "sbs": 0.9,
+    "imbc": 0.9, "ytn": 0.9, "khan": 0.85, "hani": 0.85, "seoul": 0.85,
+}
+DEFAULT_SOURCE_TIER = 0.7
+
+# ── 시세 반응 기사(재료 원문이 아님) → 신뢰도 감점 ──
+NEWS_REACTION_PATTERNS = ("특징주", "급등주", "상한가", "테마주", "관련주", "수혜주", "장중")
+
+
+def _fresh_factor(days_ago):
+    """재료 신선도 가중 — 오래된 뉴스는 프롬프트 기본조건 4에 따라 가치를 낮춘다."""
+    if days_ago <= 1:
+        return 1.0
+    if days_ago <= 3:
+        return 0.85
+    return 0.7
+
+
+def classify_dart_report(report_nm):
+    """DART 공시명을 재료 유형으로 분류. 재료성이 없으면 None."""
+    if not report_nm:
+        return None
+    name = report_nm.replace(" ", "")
+    for keyword, ctype, credibility, persistence in DART_MATERIAL_TYPES:
+        if keyword.replace(" ", "") in name:
+            # [기재정정]/[첨부정정]은 신규 재료가 아니므로 감점
+            revised = "정정" in name[:10]
+            factor = 0.6 if revised else 1.0
+            return {
+                "type": ctype,
+                "credibility": credibility * factor,
+                "persistence": persistence * factor,
+                "revised": revised,
+            }
+    return None
+
+
+def fetch_dart_disclosures(days_back=CATALYST_LOOKBACK_DAYS):
+    """DART OpenAPI에서 최근 N일 재료성 공시를 종목코드별로 수집.
+
+    주요사항보고(B) + 거래소공시(I)만 조회한다. 정기공시/지분공시/감사보고서는
+    '실질적인 이벤트'가 아니므로 애초에 가져오지 않는다.
+
+    반환: {stock_code: [{type, title, credibility, persistence, date, url, days_ago}, ...]}
+    """
+    if not DART_API_KEY:
+        log("  ⚠️ DART_API_KEY 미설정 — 공시 원출처 확인 없이 뉴스만으로 판정합니다")
+        return {}
+
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+    # 주말이 끼면 영업일이 줄어들므로 캘린더 기준으로 여유 있게 조회
+    bgn_de = (now - timedelta(days=days_back + 2)).strftime("%Y%m%d")
+    end_de = now.strftime("%Y%m%d")
+
+    log(f"  📜 DART 공시 조회 중... ({bgn_de} ~ {end_de})")
+    by_code = {}
+    total_seen = 0
+
+    for pblntf_ty in ("B", "I"):        # B=주요사항보고, I=거래소공시
+        for corp_cls in ("Y", "K"):     # Y=유가증권, K=코스닥
+            page_no = 1
+            while page_no <= 30:        # 안전 상한
+                try:
+                    resp = requests.get(
+                        "https://opendart.fss.or.kr/api/list.json",
+                        params={
+                            "crtfc_key": DART_API_KEY,
+                            "bgn_de": bgn_de,
+                            "end_de": end_de,
+                            "corp_cls": corp_cls,
+                            "pblntf_ty": pblntf_ty,
+                            "page_no": page_no,
+                            "page_count": 100,
+                        },
+                        timeout=15,
+                    )
+                    payload = resp.json()
+                except Exception as e:
+                    log(f"  ⚠️ DART 조회 실패 ({pblntf_ty}/{corp_cls} p{page_no}): {e}")
+                    break
+
+                status = payload.get("status")
+                if status == "013":     # 조회된 데이터 없음
+                    break
+                if status != "000":
+                    log(f"  ⚠️ DART 응답 오류 {status}: {payload.get('message', '')[:80]}")
+                    break
+
+                items = payload.get("list", []) or []
+                total_seen += len(items)
+                for it in items:
+                    stock_code = (it.get("stock_code") or "").strip()
+                    if len(stock_code) != 6 or not stock_code.isdigit():
+                        continue    # 비상장 계열사 등
+                    info = classify_dart_report(it.get("report_nm", ""))
+                    if not info:
+                        continue
+                    rcept_dt = (it.get("rcept_dt") or "").strip()
+                    try:
+                        d = datetime.strptime(rcept_dt, "%Y%m%d").replace(tzinfo=kst)
+                        days_ago = max(0, (now.date() - d.date()).days)
+                        date_str = d.strftime("%Y-%m-%d")
+                    except ValueError:
+                        days_ago, date_str = 0, TODAY
+                    if days_ago > days_back:
+                        continue
+                    rcept_no = (it.get("rcept_no") or "").strip()
+                    by_code.setdefault(stock_code, []).append({
+                        "type": info["type"],
+                        "title": (it.get("report_nm") or "").strip(),
+                        "credibility": info["credibility"],
+                        "persistence": info["persistence"],
+                        "revised": info["revised"],
+                        "date": date_str,
+                        "days_ago": days_ago,
+                        "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}" if rcept_no else "",
+                        "filer": (it.get("flr_nm") or "").strip(),
+                    })
+
+                try:
+                    total_page = int(payload.get("total_page", 1))
+                except (TypeError, ValueError):
+                    total_page = 1
+                if page_no >= total_page:
+                    break
+                page_no += 1
+                time.sleep(0.12)    # DART 서버 배려
+
+    # 종목별로 신뢰도 높은 순 → 최신 순 정렬
+    for code in by_code:
+        by_code[code].sort(key=lambda x: (-x["credibility"], x["days_ago"]))
+
+    log(f"  📜 DART 공시 {total_seen}건 조회 → 재료성 공시 보유 {len(by_code)}개 종목")
+    return by_code
+
+
+# ── 계약/투자 규모 파싱 ──
+_AMT_JO = re.compile(r"([\d,]+(?:\.\d+)?)\s*조\s*(?:([\d,]+(?:\.\d+)?)\s*억)?")
+_AMT_EOK = re.compile(r"([\d,]+(?:\.\d+)?)\s*억\s*(?:원|원대)?")
+_AMT_USD = re.compile(r"([\d,]+(?:\.\d+)?)\s*(조|억|천만|백만|만)?\s*(?:달러|불|USD)")
+_USD_MULT = {"조": 1e12, "억": 1e8, "천만": 1e7, "백만": 1e6, "만": 1e4, None: 1.0, "": 1.0}
+
+
+def _to_float(s):
+    try:
+        return float(str(s).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_amount_eok(text, usdkrw=1350.0):
+    """문장에서 계약/투자 규모를 억원 단위로 추출.
+
+    확인되지 않으면 (0, "") 을 반환한다 — 추정치를 만들어내지 않는다.
+    반환: (금액_억원, 근거 문자열)
+    """
+    if not text:
+        return 0.0, ""
+
+    best, src = 0.0, ""
+
+    for m in _AMT_JO.finditer(text):
+        val = _to_float(m.group(1)) * 10000            # 1조 = 10,000억
+        if m.group(2):
+            val += _to_float(m.group(2))
+        if val > best:
+            best, src = val, m.group(0).strip()
+
+    for m in _AMT_EOK.finditer(text):
+        val = _to_float(m.group(1))
+        if val > best:
+            best, src = val, m.group(0).strip()
+
+    for m in _AMT_USD.finditer(text):
+        val_usd = _to_float(m.group(1)) * _USD_MULT.get(m.group(2), 1.0)
+        val = val_usd * usdkrw / 1e8                   # 원화 환산 후 억원
+        if val > best:
+            best, src = val, m.group(0).strip()
+
+    return round(best, 1), src
+
+
+def classify_news_material(title):
+    """뉴스 제목에서 재료 유형을 판정. 재료성이 없으면 None."""
+    if not title:
+        return None
+    for keywords, ctype, credibility, persistence in NEWS_MATERIAL_KEYWORDS:
+        for kw in keywords:
+            if kw in title:
+                # 시세 반응 기사는 재료 원문이 아니므로 신뢰도를 낮춘다
+                factor = 0.6 if any(p in title for p in NEWS_REACTION_PATTERNS) else 1.0
+                return {
+                    "type": ctype,
+                    "credibility": credibility * factor,
+                    "persistence": persistence * factor,
+                    "keyword": kw,
+                }
+    return None
+
+
+def fetch_catalyst_news(stock_name, days_back=CATALYST_LOOKBACK_DAYS, display=10):
+    """종목별 최근 뉴스를 발행일과 함께 조회 (재료 판정용)."""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return []
+    try:
+        resp = requests.get(
+            "https://openapi.naver.com/v1/search/news.json",
+            headers={
+                "X-Naver-Client-Id": NAVER_CLIENT_ID,
+                "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+            },
+            params={"query": stock_name, "display": display, "sort": "date"},
+            timeout=6,
+        )
+        if resp.status_code != 200:
+            return []
+        items = resp.json().get("items", []) or []
+    except Exception:
+        return []
+
+    kst = timezone(timedelta(hours=9))
+    today = datetime.now(kst).date()
+    results = []
+    for item in items:
+        title = html.unescape(re.sub(r"<[^>]+>", "", item.get("title", ""))).strip()
+        if not title or stock_name not in title:
+            continue    # 동명이인/일반명사 오탐 방지 — 제목에 종목명이 있어야 인정
+        try:
+            pub = parsedate_to_datetime(item.get("pubDate", "")).astimezone(kst)
+            days_ago = max(0, (today - pub.date()).days)
+            pub_date = pub.strftime("%Y-%m-%d")
+        except Exception:
+            days_ago, pub_date = 0, TODAY
+        if days_ago > days_back:
+            continue
+        source = "뉴스"
+        try:
+            domain = urllib.parse.urlparse(item.get("originallink", "")).netloc
+            source = domain.replace("www.", "").split(".")[0] or "뉴스"
+        except Exception:
+            pass
+        results.append({
+            "title": title,
+            "source": source,
+            "date": pub_date,
+            "days_ago": days_ago,
+            "time_ago": _calc_time_ago(item.get("pubDate", "")),
+            "url": item.get("link", ""),
+            "summary": html.unescape(re.sub(r"<[^>]+>", "", item.get("description", ""))).strip(),
+        })
+    return results
+
+
+def load_price_history(days=CATALYST_PRICE_HISTORY_DAYS):
+    """daily_prices에서 최근 N일 종가/거래대금을 종목별 최신순으로 로드.
+
+    반환: {code: [{"date":..., "close":..., "tv":...}, ...]}  (date 내림차순)
+    """
+    cutoff = (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows, page_size, offset = [], 1000, 0
+    while True:
+        batch = supabase_request("GET", "daily_prices", params={
+            "date": f"gte.{cutoff}",
+            "select": "code,date,close,trading_value",
+            "order": "code,date.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        })
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    by_code = {}
+    for r in rows:
+        by_code.setdefault(r["code"], []).append({
+            "date": r["date"],
+            "close": float(r.get("close") or 0),
+            "tv": int(r.get("trading_value") or 0),
+        })
+    return by_code
+
+
+def compute_price_metrics(history, price, change_pct, trading_value):
+    """1일/5일/20일 수익률 + 20일 평균 거래대금 대비 배수 산출.
+
+    history에는 오늘(save_daily_close 결과)이 포함될 수 있으므로 제외하고 계산한다.
+    """
+    prev = [h for h in (history or []) if h["date"] != TODAY and h["close"] > 0]
+
+    def ret_from(n):
+        if len(prev) < n:
+            return None
+        base = prev[n - 1]["close"]
+        if base <= 0:
+            return None
+        return (price - base) / base * 100.0
+
+    ret_5d = ret_from(5)
+    ret_20d = ret_from(20)
+
+    tv_window = [h["tv"] for h in prev[:20] if h["tv"] > 0]
+    tv_avg20 = sum(tv_window) / len(tv_window) if tv_window else 0
+    tv_ratio = (trading_value / tv_avg20) if tv_avg20 > 0 else 0.0
+
+    return {
+        "ret_1d": round(change_pct, 2),
+        # 이력이 부족하면 당일 등락률로 대체 (과대평가 방지 방향)
+        "ret_5d": round(ret_5d if ret_5d is not None else change_pct, 2),
+        "ret_20d": round(ret_20d, 2) if ret_20d is not None else 0.0,
+        "has_5d": ret_5d is not None,
+        "has_20d": ret_20d is not None,
+        "tv_avg20": int(tv_avg20),
+        "tv_ratio": round(tv_ratio, 2),
+    }
+
+
+def fetch_investor_trend_multi(code, fallback_price=0, days=5):
+    """네이버 종목별 투자자 동향 최근 N거래일 합산 (억원)."""
+    try:
+        resp = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/trend",
+            params={"pageSize": days},
+            headers=NAVER_STOCK_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data:
+            return None
+    except Exception as e:
+        log(f"  ⚠️ 투자자 동향 조회 실패 ({code}): {e}")
+        return None
+
+    eok = 100_000_000
+    f_sum = i_sum = ind_sum = 0.0
+    hold_pct = 0.0
+    for idx, row in enumerate(data[:days]):
+        close = _to_float(row.get("closePrice", 0)) or fallback_price
+        if close <= 0:
+            continue
+        f_sum += _to_float(row.get("foreignerPureBuyQuant", 0)) * close / eok
+        i_sum += _to_float(row.get("organPureBuyQuant", 0)) * close / eok
+        ind_sum += _to_float(row.get("individualPureBuyQuant", 0)) * close / eok
+        if idx == 0:
+            hold_pct = _to_float(str(row.get("foreignerHoldRatio", "0")).replace("%", ""))
+
+    return {
+        "foreign_net_5d": round(f_sum, 1),
+        "institution_net_5d": round(i_sum, 1),
+        "individual_net_5d": round(ind_sum, 1),
+        "foreign_ratio": round(hold_pct, 2),
+    }
+
+
+# ── 점수 산출 (100점 만점) ──
+
+_VALUE_TYPE_BASE = {
+    "인허가": 19, "독점공급": 18, "기술이전": 18, "공급계약": 16, "수주": 16,
+    "임상": 16, "M&A": 16, "실적변동": 15, "지분투자": 14, "설비투자": 14,
+    "정부프로젝트": 13, "투자유치": 13, "해외진출": 12, "주요경영사항": 11,
+    "기술": 10, "협력": 9, "자사주": 8, "자금조달": 6,
+}
+
+
+def _score_value(catalyst_type, amount_eok, market_cap_eok):
+    """② 기업가치에 미치는 영향 (25점) — 재료 유형 + 계약규모/시총 비율"""
+    base = _VALUE_TYPE_BASE.get(catalyst_type, 10)
+    bonus = 0.0
+    if amount_eok > 0 and market_cap_eok > 0:
+        ratio = amount_eok / market_cap_eok * 100
+        if ratio >= 50:
+            bonus = 9
+        elif ratio >= 25:
+            bonus = 7
+        elif ratio >= 10:
+            bonus = 5
+        elif ratio >= 5:
+            bonus = 3
+        elif ratio >= 1:
+            bonus = 1.5
+        else:
+            bonus = 0.5
+    return round(min(25.0, base + bonus), 1)
+
+
+def _score_unpriced(ret_1d, ret_5d, ret_20d):
+    """③ 주가 미반영 정도 (20점) — 단기 급등 종목은 재료가 좋아도 감점"""
+    reflected = max(ret_1d, ret_5d)
+    if reflected >= 30:
+        base = 0.0
+    elif reflected >= 20:
+        base = 4.0
+    elif reflected >= 12:
+        base = 9.0
+    elif reflected >= 6:
+        base = 14.0
+    elif reflected >= 0:
+        base = 18.0
+    else:
+        base = 20.0     # 재료가 났는데 오히려 눌림 = 완전 미반영
+    if ret_20d >= 60:
+        base -= 5
+    elif ret_20d >= 35:
+        base -= 3
+    return round(max(0.0, min(20.0, base)), 1)
+
+
+def _score_trading(tv_ratio):
+    """④ 거래대금 (8점) — 평소 대비 실제로 자금이 들어왔는지"""
+    if tv_ratio >= 5:
+        return 8.0
+    if tv_ratio >= 3:
+        return 6.5
+    if tv_ratio >= 2:
+        return 5.0
+    if tv_ratio >= 1.5:
+        return 3.5
+    if tv_ratio >= 1.2:
+        return 2.0
+    return 1.0 if tv_ratio > 0 else 0.0
+
+
+def _score_supply(foreign_net, institution_net, market_cap_eok):
+    """⑤ 수급 (7점) — 외국인·기관 5거래일 누적 순매수 / 시총 비율"""
+    if market_cap_eok <= 0:
+        return 0.0
+    ratio = (foreign_net + institution_net) / market_cap_eok * 100
+    if ratio >= 1.0:
+        score = 7.0
+    elif ratio >= 0.5:
+        score = 5.5
+    elif ratio >= 0.2:
+        score = 4.0
+    elif ratio > 0:
+        score = 2.5
+    elif ratio == 0:
+        score = 1.0
+    elif ratio > -0.3:
+        score = 0.5
+    else:
+        score = 0.0
+    if foreign_net > 0 and institution_net > 0:
+        score = min(7.0, score + 1.0)   # 쌍끌이 매수 가산
+    return round(score, 1)
+
+
+def _score_momentum(persistence, event_count, freshness):
+    """⑥ 향후 추가 모멘텀 (15점) — 재료 지속성 + 후속 이벤트 존재 여부"""
+    score = persistence * freshness
+    if event_count >= 3:
+        score += 2
+    elif event_count == 2:
+        score += 1
+    return round(max(0.0, min(15.0, score)), 1)
+
+
+def crawl_catalyst_stocks(krx_data, themes=None, stock_themes=None, usdkrw=1350.0):
+    """재료 포착 TOP 10 산출.
+
+    1) 시총 3000억+ 전 종목을 동일 기준으로 스크리닝 (섹터 중립)
+    2) DART 재료성 공시 보유 종목 + 거래대금 급증 종목을 후보로
+    3) 후보별 뉴스를 조회해 재료 유형/규모/원출처 확정
+    4) 5개 축 100점 스코어링 → 상위권만 수급 조회 → 최종 TOP 10
+    """
+    log("🎯 재료 포착 종목 산출 시작...")
+
+    dart_map = fetch_dart_disclosures(CATALYST_LOOKBACK_DAYS)
+    history = load_price_history()
+    if not history:
+        log("  ⚠️ daily_prices 데이터 없음 — 수익률 판정 정확도가 낮아집니다")
+
+    # 인기 테마 소속 종목 (태그 표시용)
+    stock_theme_names = {}
+    for t in (themes or []):
+        tname = t.get("name", "")
+        for part in (t.get("leading_stocks", "") or "").split(","):
+            bits = part.strip().split(":")
+            if len(bits) >= 2 and bits[1].strip().isdigit():
+                stock_theme_names.setdefault(bits[1].strip(), [])
+                if tname and tname not in stock_theme_names[bits[1].strip()]:
+                    stock_theme_names[bits[1].strip()].append(tname)
+
+    # ── 1단계: 기본 조건 (시총 3000억+, 섹터 무관) ──
+    pool = []
+    for code, d in krx_data.items():
+        if d.get("market_cap", 0) < CATALYST_MIN_MARKET_CAP:
+            continue
+        if is_etf_etn(d.get("name", "")):
+            continue
+        if d.get("price", 0) <= 0 or d.get("volume", 0) <= 0:
+            continue
+        m = compute_price_metrics(
+            history.get(code, []),
+            d["price"],
+            d.get("change_pct", 0),
+            d.get("trading_value", 0),
+        )
+        pool.append((d, m))
+
+    log(f"  📋 기본 조건 통과: {len(pool)}개 종목 (시총 3000억+)")
+
+    # ── 2단계: 재료 후보 선별 ──
+    #    (a) DART 재료성 공시 보유 → 무조건 포함
+    #    (b) 공시는 없지만 거래대금이 평소 2배 이상 터진 종목 → 뉴스에서 재료 탐색
+    with_dart, surged = [], []
+    for d, m in pool:
+        if d["code"] in dart_map:
+            with_dart.append((d, m))
+        elif m["tv_ratio"] >= 2.0 and d.get("trading_value", 0) >= CATALYST_MIN_TRADING_VALUE:
+            surged.append((d, m))
+
+    with_dart.sort(key=lambda x: (-dart_map[x[0]["code"]][0]["credibility"], -x[0].get("trading_value", 0)))
+    surged.sort(key=lambda x: -x[1]["tv_ratio"])
+
+    room = max(0, CATALYST_NEWS_FETCH_LIMIT - len(with_dart))
+    candidates = with_dart[:CATALYST_NEWS_FETCH_LIMIT] + surged[:room]
+    log(f"  🔎 재료 후보 {len(candidates)}개 (공시 {len(with_dart[:CATALYST_NEWS_FETCH_LIMIT])} / 거래급증 {len(surged[:room])})")
+
+    if not candidates:
+        log("  ℹ️ 재료 후보 없음")
+        return []
+
+    # ── 3단계: 후보별 뉴스 조회 + 재료 확정 + 스코어링 ──
+    scored = []
+    for d, m in candidates:
+        code, name = d["code"], d["name"]
+        news_items = fetch_catalyst_news(name)
+        disclosures = dart_map.get(code, [])
+
+        # 재료 확정: 공시가 있으면 공시 우선(원출처), 없으면 뉴스
+        material_news = []
+        for n in news_items:
+            info = classify_news_material(n["title"])
+            if info:
+                material_news.append((n, info))
+
+        if disclosures:
+            top = disclosures[0]
+            catalyst = {
+                "type": top["type"],
+                "title": top["title"],
+                "source": "DART공시",
+                "date": top["date"],
+                "url": top["url"],
+                "days_ago": top["days_ago"],
+                "credibility": top["credibility"],
+                "persistence": top["persistence"],
+            }
+            event_count = len(disclosures)
+        elif material_news:
+            n, info = max(material_news, key=lambda x: (x[1]["credibility"], -x[0]["days_ago"]))
+            tier = NEWS_SOURCE_TIER.get(n["source"], DEFAULT_SOURCE_TIER)
+            catalyst = {
+                "type": info["type"],
+                "title": n["title"],
+                "source": f"언론({n['source']})",
+                "date": n["date"],
+                "url": n["url"],
+                "days_ago": n["days_ago"],
+                "credibility": min(12.0, info["credibility"] * tier),
+                "persistence": info["persistence"],
+            }
+            event_count = len(material_news)
+        else:
+            continue    # 재료 없음 — 이 탭의 목적에 맞지 않으므로 제외
+
+        freshness = _fresh_factor(catalyst["days_ago"])
+
+        # 계약/투자 규모: 공시명 + 재료 뉴스 제목·요약에서만 추출 (없으면 미확인)
+        amount_pool = [catalyst["title"]]
+        for n, _info in material_news[:3]:
+            amount_pool.append(n["title"])
+            amount_pool.append(n.get("summary", ""))
+        amount_eok, amount_src = 0.0, ""
+        for text in amount_pool:
+            val, src = parse_amount_eok(text, usdkrw)
+            if val > amount_eok:
+                amount_eok, amount_src = val, src
+        market_cap_eok = d.get("market_cap", 0) / 1e8
+        # 시총의 20배를 넘는 금액은 오인식으로 보고 버린다 (미확인 처리)
+        if market_cap_eok > 0 and amount_eok > market_cap_eok * 20:
+            amount_eok, amount_src = 0.0, ""
+
+        score_news = round(min(25.0, catalyst["credibility"] * freshness), 1)
+        score_value = _score_value(catalyst["type"], amount_eok, market_cap_eok)
+        score_unpriced = _score_unpriced(m["ret_1d"], m["ret_5d"], m["ret_20d"])
+        score_trading = _score_trading(m["tv_ratio"])
+        score_momentum = _score_momentum(catalyst["persistence"], event_count, freshness)
+
+        scored.append({
+            "d": d, "m": m,
+            "catalyst": catalyst,
+            "disclosures": disclosures[:5],
+            "news": news_items[:5],
+            "amount_eok": amount_eok,
+            "amount_src": amount_src,
+            "market_cap_eok": market_cap_eok,
+            "score_news": score_news,
+            "score_value": score_value,
+            "score_unpriced": score_unpriced,
+            "score_trading": score_trading,
+            "score_momentum": score_momentum,
+            "score_supply": 0.0,
+            "base_total": score_news + score_value + score_unpriced + score_trading + score_momentum,
+        })
+
+    log(f"  📊 재료 확인된 종목 {len(scored)}개")
+    if not scored:
+        return []
+
+    # ── 4단계: 상위 후보만 수급 조회 후 최종 랭킹 ──
+    scored.sort(key=lambda x: -x["base_total"])
+    log(f"  💰 상위 {min(CATALYST_FLOW_FETCH_LIMIT, len(scored))}개 종목 투자자 수급 조회 중...")
+    for s in scored[:CATALYST_FLOW_FETCH_LIMIT]:
+        flow = fetch_investor_trend_multi(s["d"]["code"], s["d"].get("price", 0))
+        if flow:
+            s.update(flow)
+            s["score_supply"] = _score_supply(
+                flow["foreign_net_5d"], flow["institution_net_5d"], s["market_cap_eok"]
+            )
+
+    for s in scored:
+        s["total"] = round(s["base_total"] + s["score_supply"], 1)
+    scored.sort(key=lambda x: -x["total"])
+
+    gen_time = datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
+    result = []
+    for rank_idx, s in enumerate(scored[:CATALYST_TOP_N], 1):
+        d, m, c = s["d"], s["m"], s["catalyst"]
+        result.append({
+            "date": TODAY,
+            "rank": rank_idx,
+            "code": d["code"],
+            "name": d["name"],
+            "market": d.get("market", ""),
+            "display_sector": d.get("display_sector", ""),
+            "tags": classify_stock_tags(
+                d["name"],
+                d.get("display_sector", ""),
+                stock_theme_names.get(d["code"]),
+                theme_map_themes=(stock_themes.get(d["code"]) if stock_themes else None),
+            ),
+            "market_cap": int(d.get("market_cap", 0)),
+            "price": float(d["price"]),
+            "ret_1d": m["ret_1d"],
+            "ret_5d": m["ret_5d"],
+            "ret_20d": m["ret_20d"],
+            "trading_value": int(d.get("trading_value", 0)),
+            "tv_avg20": m["tv_avg20"],
+            "tv_ratio": m["tv_ratio"],
+            "foreign_net_5d": s.get("foreign_net_5d", 0),
+            "institution_net_5d": s.get("institution_net_5d", 0),
+            "individual_net_5d": s.get("individual_net_5d", 0),
+            "foreign_ratio": s.get("foreign_ratio", 0),
+            "catalyst_type": c["type"],
+            "catalyst_title": c["title"],
+            "catalyst_source": c["source"],
+            "catalyst_date": c["date"],
+            "catalyst_url": c["url"],
+            "catalyst_amount": s["amount_eok"],
+            "catalyst_amount_src": s["amount_src"],
+            "disclosures": json.dumps(s["disclosures"], ensure_ascii=False),
+            "news_list": json.dumps(s["news"], ensure_ascii=False),
+            "score_news": s["score_news"],
+            "score_value": s["score_value"],
+            "score_unpriced": s["score_unpriced"],
+            "score_flow": round(s["score_trading"] + s["score_supply"], 1),
+            "score_momentum": s["score_momentum"],
+            "total_score": s["total"],
+            "why_now": "",
+            "catalyst_impact": "",
+            "priced_in": "",
+            "generated_time": gen_time,
+        })
+
+    log(f"  ✅ 재료 포착 TOP {len(result)} 선정")
+    for r in result:
+        amt = f"{r['catalyst_amount']:,.0f}억" if r["catalyst_amount"] > 0 else "규모 미확인"
+        log(f"     {r['rank']}. {r['name']} {r['total_score']}점 · {r['catalyst_type']}({r['catalyst_source']}) "
+            f"· {amt} · 5일 {r['ret_5d']:+.1f}%")
+    return result
+
+
+def generate_catalyst_commentary(catalysts):
+    """재료 포착 TOP 10 종목별 설명 3문장 생성 (Groq AI).
+
+    - 왜 지금 이 종목을 보는지
+    - 어떤 뉴스가 주가를 움직일 수 있는지
+    - 이미 얼마나 주가에 반영됐는지
+
+    수집된 사실만 근거로 쓰게 하고, 없는 수치를 만들어내지 못하도록 강하게 제약한다.
+    실패하면 catalysts를 그대로(설명 없이) 반환한다 — 표는 정상 표시된다.
+    """
+    if not catalysts:
+        return catalysts
+    if not GROQ_API_KEY:
+        log("  ⚠️ GROQ_API_KEY 미설정 — 재료 종목 설명 건너뜀")
+        return catalysts
+
+    blocks = []
+    for c in catalysts:
+        amount = f"{c['catalyst_amount']:,.0f}억원 (근거 표현: '{c['catalyst_amount_src']}')" \
+            if c["catalyst_amount"] > 0 else "미확인 (공시·기사에 금액이 명시되지 않음)"
+        try:
+            news_titles = [n["title"] for n in json.loads(c.get("news_list", "[]"))][:4]
+        except Exception:
+            news_titles = []
+        try:
+            disc_titles = [f"{d['date']} {d['title']}" for d in json.loads(c.get("disclosures", "[]"))][:4]
+        except Exception:
+            disc_titles = []
+
+        blocks.append(
+            f"[{c['rank']}위] {c['name']} ({c['code']}) / {c['display_sector'] or '미분류'} / {c['market']}\n"
+            f"- 시가총액: {c['market_cap'] / 1e8:,.0f}억원, 현재가: {c['price']:,.0f}원\n"
+            f"- 수익률: 1일 {c['ret_1d']:+.2f}%, 5일 {c['ret_5d']:+.2f}%, 20일 {c['ret_20d']:+.2f}%\n"
+            f"- 거래대금: {c['trading_value'] / 1e8:,.0f}억원 (20일 평균 대비 {c['tv_ratio']:.2f}배)\n"
+            f"- 수급(최근 5거래일 누적): 외국인 {c['foreign_net_5d']:+,.0f}억, "
+            f"기관 {c['institution_net_5d']:+,.0f}억, 개인 {c['individual_net_5d']:+,.0f}억\n"
+            f"- 핵심 재료: [{c['catalyst_type']}] {c['catalyst_title']}\n"
+            f"- 재료 출처: {c['catalyst_source']} / 발생일 {c['catalyst_date']}\n"
+            f"- 계약·투자 규모: {amount}\n"
+            f"- 최근 공시: {' | '.join(disc_titles) if disc_titles else '없음'}\n"
+            f"- 관련 뉴스 제목: {' | '.join(news_titles) if news_titles else '없음'}\n"
+            f"- 점수: 뉴스질 {c['score_news']}/25, 가치영향 {c['score_value']}/25, "
+            f"미반영 {c['score_unpriced']}/20, 거래·수급 {c['score_flow']}/15, "
+            f"모멘텀 {c['score_momentum']}/15 → 총 {c['total_score']}/100"
+        )
+
+    prompt = f"""당신은 한국 주식시장 애널리스트입니다.
+아래는 오늘({TODAY}) 실질적인 재료가 확인된 종목 {len(catalysts)}개의 수집 데이터입니다.
+
+이 리스트의 목적은 '좋은 종목'이 아니라
+'좋은 재료가 발생했는데 아직 주가에 충분히 반영되지 않은 종목'을 골라내는 것입니다.
+
+[사실 데이터]
+{chr(10).join(blocks)}
+
+[절대 규칙 — 반드시 지킬 것]
+1. 위 [사실 데이터]에 적힌 수치·날짜·출처만 사용하라.
+2. 데이터에 없는 계약금액, 고객사명, 임상 단계, 승인 일정, 목표주가를 절대 만들어내지 마라.
+3. 계약·투자 규모가 '미확인'이면 반드시 "규모 미공개"라고 쓰고, 임의의 금액을 추정하지 마라.
+4. 재료 출처가 'DART공시'면 회사 공시로, '언론(...)'이면 언론 보도로 정확히 구분해서 서술하라.
+5. 수익률·수급·거래대금은 주어진 숫자를 그대로 인용하라. 반올림 외 변형 금지.
+6. "관망", "주목할 필요" 같은 애매한 표현 금지. 판단과 근거를 명확히 써라.
+
+[각 종목마다 아래 3가지를 각각 2~3문장으로 작성]
+- why_now: 왜 지금 이 종목을 보는지. 재료의 성격과 신뢰도(공시/언론), 규모, 시총 대비 의미를 근거로.
+- catalyst_impact: 어떤 뉴스가 앞으로 주가를 움직일 수 있는지. 후속 이벤트(추가 수주·실적 반영·승인 등) 가능성 중심으로.
+- priced_in: 이미 얼마나 주가에 반영됐는지. 1일/5일/20일 수익률과 거래대금 배수, 수급을 근거로 과열/미반영 여부를 명확히 판정.
+
+JSON 형식으로만 답하라:
+{{
+  "stocks": [
+    {{
+      "code": "종목코드 6자리",
+      "why_now": "2~3문장",
+      "catalyst_impact": "2~3문장",
+      "priced_in": "2~3문장"
+    }}
+  ]
+}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 8192,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=90,
+        )
+        if resp.status_code != 200:
+            log(f"  ⚠️ Groq 재료 종목 설명 오류: {resp.status_code} - {resp.text[:200]}")
+            return catalysts
+
+        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
+        by_code = {str(s.get("code", "")).zfill(6): s for s in parsed.get("stocks", []) if s.get("code")}
+
+        filled = 0
+        for c in catalysts:
+            s = by_code.get(c["code"])
+            if not s:
+                continue
+            c["why_now"] = (s.get("why_now") or "").strip()
+            c["catalyst_impact"] = (s.get("catalyst_impact") or "").strip()
+            c["priced_in"] = (s.get("priced_in") or "").strip()
+            if c["why_now"]:
+                filled += 1
+
+        log(f"  🤖 재료 종목 설명 생성 완료 ({filled}/{len(catalysts)}종목)")
+        return catalysts
+
+    except Exception as e:
+        log(f"  ⚠️ 재료 종목 설명 생성 실패: {e}")
+        return catalysts
+
+
+def seed_oversold_track(oversold):
+    """오늘 과대 낙폭 종목(엔벨로프 20 하단 이탈 + 거래대금 1000억+) 중
+    전 거래일에도 같은 조건이었던 종목(2일 연속)을 성과 추적에 편입.
+
+    entry_price = 선정일 종가 (= 그날 종가에 샀다고 가정한 가상 매수단가).
+    같은 날 재실행되면 오늘분만 지우고 다시 넣으므로 중복되지 않는다.
+    close 모드(확정 종가)에서만 호출할 것 — 15:00 장중 시세로 편입하면 진입가가 틀어진다.
+    """
+    if oversold is None:
+        return []
+    existing = {r["code"] for r in (supabase_request("GET", "oversold_track", params={
+        "pick_date": f"eq.{TODAY}", "select": "code"}) or [])}
+    supabase_request("DELETE", "oversold_track", params={"pick_date": f"eq.{TODAY}"})
+
+    rows, skipped, first_day = [], [], []
+    for o in oversold:
+        price = float(o.get("price") or 0)
+        if price <= 0 or int(o.get("trading_value") or 0) < OVERSOLD_MIN_TRADING_VALUE:
+            continue
+        if o["code"] not in _OVERSOLD_PREV:   # 2일 연속 과대 낙폭일 때만 편입
+            first_day.append(o.get("name", o["code"]))
+            continue
+        if o["code"] in _OVERSOLD_RECENT:
+            skipped.append(f"{o.get('name', o['code'])}({_OVERSOLD_RECENT[o['code']][5:]})")
+            continue
+        rows.append({
+            "pick_date": TODAY,
+            "code": o["code"],
+            "name": o.get("name", ""),
+            "market": o.get("market", ""),
+            "display_sector": o.get("display_sector", ""),
+            "rank": o.get("rank", 0),
+            "ma20": o.get("ma20", 0),
+            "deviation": o.get("deviation", 0),
+            "trading_value": int(o.get("trading_value") or 0),
+            "market_cap": int(o.get("market_cap") or 0),
+            "entry_price": price,
+            "last_price": price,
+            "last_date": TODAY,
+            "days_tracked": 0,
+            "ret_cum": 0,
+            "max_ret": 0,
+            "min_ret": 0,
+            "status": "open",
+        })
+
+    if first_day:
+        log(f"  ⏳ 오늘 처음 과대 낙폭 (내일도 조건이면 편입): {', '.join(first_day)}")
+    if skipped:
+        log(f"  ⏭ 연속 이탈 전 {OVERSOLD_TRACK_COOLDOWN}거래일 안에 이미 -20% 이탈 → 성과 추적 제외: {', '.join(skipped)}")
+    if not rows:
+        log("  ℹ️ 성과 추적 편입 종목 없음")
+        return []
+    result = supabase_request("POST", "oversold_track", data=rows)
+    log(f"  📈 과대 낙폭 성과 추적 편입 {len(rows)}종목 {'✅' if result else '❌'}")
+    # 알림용: 오늘 앞선 실행(15:35)에서 이미 편입된 종목은 빼고 새로 들어온 것만
+    return [r for r in rows if r["code"] not in existing] if result else []
+
+
+def _load_prior_closes(codes, need):
+    """daily_prices 에서 종목별 오늘 이전 종가를 최신순으로 need 개까지 반환 {code: [close, ...]}."""
+    out = {}
+    codes = sorted(set(codes))
+    cutoff = (datetime.now(timezone(timedelta(hours=9))) - timedelta(days=max(30, need * 3))).strftime("%Y-%m-%d")
+    for i in range(0, len(codes), 80):
+        chunk = codes[i:i + 80]
+        offset = 0
+        while True:
+            batch = supabase_request("GET", "daily_prices", params={
+                "code": f"in.({','.join(chunk)})",
+                "date": f"lt.{TODAY}",
+                "and": f"(date.gte.{cutoff})",
+                "select": "code,date,close",
+                "order": "code,date.desc",
+                "limit": "1000",
+                "offset": str(offset),
+            })
+            if not batch:
+                break
+            for r in batch:
+                lst = out.setdefault(r["code"], [])
+                if len(lst) < need:
+                    lst.append(float(r["close"]))
+            if len(batch) < 1000:
+                break
+            offset += 1000
+    return out
+
+
+def _update_bet_track(table, krx_data, label, take_profit=None, stop_loss=None, exit_ma=None):
+    """진행 중(open)인 배팅 추적 종목을 오늘 종가로 갱신 (과대 낙폭 / 주도주 공통).
+
+    청산 규칙은 둘 중 하나:
+    - take_profit / stop_loss: 종가 수익률 >= take_profit → 익절(win), <= stop_loss → 손절(loss)
+    - exit_ma=N: 오늘 종가 < N일 이동평균(오늘 종가 포함) → 매도. 그때 수익률 > 0 이면 win, 아니면 loss.
+      N일치 종가가 안 모인 종목(신규 상장 등)은 판단하지 않고 계속 보유.
+    마감 시 close_date / close_price / close_ret / hold_days 기록, 아니면 현재 수익률·최고·최저만 갱신.
+    close 모드에서 하루 1회 전제 (last_date != TODAY 인 행만 → 같은 날 재실행해도 안전).
+    """
+    if not krx_data:
+        return 0
+
+    open_rows = []
+    offset = 0
+    while True:
+        batch = supabase_request("GET", table, params={
+            "status": "eq.open",
+            "last_date": f"neq.{TODAY}",
+            "select": "id,code,name,entry_price,days_tracked,max_ret,min_ret",
+            "order": "id",
+            "limit": "1000",
+            "offset": str(offset),
+        })
+        if not batch:
+            break
+        open_rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    if not open_rows:
+        log(f"  ℹ️ 갱신할 {label} 추적 종목 없음")
+        return []
+
+    prior = _load_prior_closes([r["code"] for r in open_rows], exit_ma - 1) if exit_ma else {}
+
+    now_iso = datetime.now(timezone(timedelta(hours=9))).isoformat()
+    updated, wins, losses, skipped = 0, 0, 0, 0
+    closed_list = []
+    for row in open_rows:
+        d = krx_data.get(row["code"])
+        price = float(d.get("price", 0)) if d else 0
+        entry = float(row.get("entry_price") or 0)
+        if price <= 0 or entry <= 0:
+            skipped += 1   # 거래정지 등 — 오늘은 카운트하지 않음
+            continue
+
+        days = int(row.get("days_tracked") or 0) + 1
+        ret = round((price - entry) / entry * 100, 2)
+        payload = {
+            "last_price": price,
+            "last_date": TODAY,
+            "days_tracked": days,
+            "ret_cum": ret,
+            "max_ret": max(float(row.get("max_ret") or 0), ret),
+            "min_ret": min(float(row.get("min_ret") or 0), ret),
+            "updated_at": now_iso,
+        }
+        result = None
+        if exit_ma:
+            closes = prior.get(row["code"], [])
+            if len(closes) >= exit_ma - 1:
+                ma = (price + sum(closes[:exit_ma - 1])) / exit_ma
+                payload["last_ma"] = round(ma, 2)
+                if price < ma:
+                    result = "win" if ret > 0 else "loss"
+        else:
+            if take_profit is not None and ret >= take_profit:
+                result = "win"
+            elif stop_loss is not None and ret <= stop_loss:
+                result = "loss"
+        if result == "win":
+            wins += 1
+        elif result == "loss":
+            losses += 1
+        if result:
+            payload.update({
+                "status": "closed",
+                "result": result,
+                "close_date": TODAY,
+                "close_price": price,
+                "close_ret": ret,
+                "hold_days": days,
+            })
+            closed_list.append({"kind": label, "name": row.get("name") or row["code"], "code": row["code"],
+                                "result": result, "ret": ret, "days": days,
+                                "reason": f"{exit_ma}일선 이탈" if exit_ma else ("익절선 도달" if result == "win" else "손절선 도달")})
+
+        # PATCH 는 return=minimal 이라 성공해도 None — 실패는 supabase_request 안에서 로그로 남음
+        supabase_request("PATCH", table, data=payload, params={"id": f"eq.{row['id']}"})
+        updated += 1
+
+    log(f"  📈 {label} 성과 추적 갱신 {updated}종목 (익절 {wins} · 손절 {losses} · 시세없음 {skipped})")
+    return closed_list
+
+
+def update_oversold_track(krx_data):
+    """과대 낙폭 추적: 종가 +10% 익절 / -10% 손절. 오늘 마감된 종목 목록을 반환."""
+    return _update_bet_track("oversold_track", krx_data, "과대 낙폭",
+                             take_profit=OVERSOLD_TRACK_TAKE_PROFIT, stop_loss=OVERSOLD_TRACK_STOP_LOSS)
+
+
+def update_leader_track(krx_data):
+    """주도주 배팅 추적: 종가가 10일 이동평균선 아래로 내려가면 매도. 오늘 마감된 종목 목록을 반환."""
+    return _update_bet_track("leader_track", krx_data, "주도주", exit_ma=LEADER_TRACK_EXIT_MA)
+
+
+def select_leader_stocks(krx_data, theme_map):
+    """주도 테마의 대장주 선정.
+
+    주도 테마 = 테마 안에 '당일 +10% 이상 · 거래대금 1,000억 이상' 종목이 대장 포함 3개 이상
+              (개별 종목 혼자 오른 날은 제외 — 테마가 같이 올라야 함)
+    대장     = 그 충족 종목 중 상승률(50) + 거래대금(50) 정규화 점수 1위
+    테마 순서 = 충족 종목 수 ↓ → 구체적인 테마 우선(로봇 > 기계) → 충족 종목 평균 상승률 ↓ → 거래대금 합 ↓
+    같은 종목이 여러 테마의 대장이면 가장 강한 테마 하나로 편입하고 나머지는 other_themes 로 기록.
+    """
+    if not krx_data or not theme_map:
+        return []
+    log("🔥 주도주 선정 시작...")
+
+    themes = []
+    for theme_name, stocks in theme_map.items():
+        hits, seen = [], set()
+        for s in stocks:
+            code = s.get("code")
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            d = krx_data.get(code)
+            if not d or is_etf_etn(d.get("name", "")):
+                continue
+            cp = float(d.get("change_pct", 0) or 0)
+            tv = int(d.get("trading_value", 0) or 0)
+            if cp >= LEADER_MIN_CHANGE and tv >= LEADER_MIN_TRADING_VALUE and d.get("price", 0) > 0:
+                hits.append(d)
+        if len(hits) < LEADER_MIN_THEME_STOCKS:
+            continue
+        max_cp = max(float(h["change_pct"]) for h in hits) or 1
+        max_tv = max(int(h["trading_value"]) for h in hits) or 1
+        scored = sorted(hits, key=lambda h: float(h["change_pct"]) / max_cp * 50 + int(h["trading_value"]) / max_tv * 50,
+                        reverse=True)
+        themes.append({
+            "name": theme_name,
+            "hits": scored,
+            "leader": scored[0],
+            "avg": sum(float(h["change_pct"]) for h in hits) / len(hits),
+            "tv_sum": sum(int(h["trading_value"]) for h in hits),
+        })
+
+    themes.sort(key=lambda t: (-len(t["hits"]), THEME_SPECIFICITY.get(t["name"], 3), -t["avg"], -t["tv_sum"]))
+
+    picks, by_code = [], {}
+    for t in themes:
+        code = t["leader"]["code"]
+        if code in by_code:
+            by_code[code]["other_themes"].append(t["name"])
+            continue
+        if len(picks) >= LEADER_MAX_PICKS:
+            continue
+        pick = {"theme": t, "other_themes": []}
+        picks.append(pick)
+        by_code[code] = pick
+
+    result = []
+    for rank, pk in enumerate(picks, 1):
+        t, d = pk["theme"], pk["theme"]["leader"]
+        _, _, news_json = _search_theme_news_api(f"{t['name']} 주식", t["name"])
+        try:
+            news = json.loads(news_json or "[]")
+        except Exception:
+            news = []
+        result.append({
+            "pick_date": TODAY,
+            "code": d["code"],
+            "name": d.get("name", ""),
+            "market": d.get("market", ""),
+            "display_sector": d.get("display_sector", ""),
+            "rank": rank,
+            "change_pct": round(float(d.get("change_pct", 0)), 2),
+            "trading_value": int(d.get("trading_value", 0)),
+            "market_cap": int(d.get("market_cap", 0)),
+            "theme_name": t["name"],
+            "theme_count": len(t["hits"]),
+            "theme_avg_pct": round(t["avg"], 2),
+            "theme_stocks": [{"name": h.get("name", ""), "code": h["code"],
+                              "change_pct": round(float(h["change_pct"]), 2),
+                              "trading_value": int(h["trading_value"])} for h in t["hits"]],
+            "other_themes": pk["other_themes"],
+            "news_list": news,
+            "entry_price": float(d["price"]),
+            "last_price": float(d["price"]),
+            "last_date": TODAY,
+            "days_tracked": 0,
+            "ret_cum": 0,
+            "max_ret": 0,
+            "min_ret": 0,
+            "status": "open",
+        })
+
+    log(f"  ✅ 주도 테마 {len(themes)}개 → 대장 {len(result)}종목 편입 대상")
+    for r in result:
+        log(f"     {r['rank']}. [{r['theme_name']}] {r['name']} {r['change_pct']:+.2f}% "
+            f"(동반 {r['theme_count']}종목, 뉴스 {len(r['news_list'])}건)")
+    return result
+
+
+def seed_leader_track(picks):
+    """오늘 주도주를 leader_track 에 편입 (오늘분 교체 → 재실행 안전)."""
+    if picks is None:
+        return []
+    existing = {r["code"] for r in (supabase_request("GET", "leader_track", params={
+        "pick_date": f"eq.{TODAY}", "select": "code"}) or [])}
+    supabase_request("DELETE", "leader_track", params={"pick_date": f"eq.{TODAY}"})
+    if not picks:
+        log("  ℹ️ 오늘은 주도 테마 없음 — 주도주 편입 없음")
+        return []
+    result = supabase_request("POST", "leader_track", data=picks)
+    log(f"  🔥 주도주 성과 추적 편입 {len(picks)}종목 {'✅' if result else '❌'}")
+    return [r for r in picks if r["code"] not in existing] if result else []
+
+
+# ── 급등주 급락 매수 (pullback_track) ──
+def _fetch_naver_today_open(code):
+    """네이버 일봉 차트에서 오늘 시가. 오늘 봉이 없거나 실패하면 0."""
+    for attempt in range(3):
+        try:
+            r = requests.get("https://fchart.stock.naver.com/sise.nhn",
+                             params={"symbol": code, "timeframe": "day", "count": 3, "requestType": 0},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                time.sleep(1 + attempt)
+                continue
+            last = None
+            for m in _NAVER_CHART_RE.finditer(r.text):
+                last = m.groups()
+            if last and f"{last[0][:4]}-{last[0][4:6]}-{last[0][6:]}" == TODAY:
+                return float(last[1])
+            return 0
+        except Exception:
+            time.sleep(1 + attempt)
+    return 0
+
+
+def update_pullback_track(krx_data):
+    """진행 중(open) 종목 갱신(+10% 익절 / -10% 손절). 오늘 마감된 종목 목록을 반환."""
+    return _update_bet_track("pullback_track", krx_data, "급등주 급락",
+                             take_profit=PULLBACK_TAKE_PROFIT, stop_loss=PULLBACK_STOP_LOSS)
+
+
+def update_pullback_watch(krx_data):
+    """감시 중(watch) 종목: 오늘 종가 < 급등일 시가면 그 종가에 매수(open), 20거래일 지나면 만료.
+
+    update_pullback_track 다음에 호출 (오늘 진입한 종목은 다음 거래일부터 익절/손절 판정).
+    오늘 새로 진입한 행 목록을 반환.
+    """
+    if not krx_data:
+        return []
+    rows, offset = [], 0
+    while True:
+        batch = supabase_request("GET", "pullback_track", params={
+            "status": "eq.watch", "last_date": f"neq.{TODAY}",
+            "select": "id,code,name,signal_date,signal_open,signal_change,trading_value,watch_days",
+            "order": "id", "limit": "1000", "offset": str(offset)})
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    if not rows:
+        log("  ℹ️ 감시 중인 급등주 급락 종목 없음")
+        return []
+
+    now_iso = datetime.now(timezone(timedelta(hours=9))).isoformat()
+    entered, expired, waiting, skipped = [], 0, 0, 0
+    for row in rows:
+        d = krx_data.get(row["code"])
+        price = float(d.get("price", 0)) if d else 0
+        sig_open = float(row.get("signal_open") or 0)
+        if price <= 0 or sig_open <= 0:
+            skipped += 1   # 거래정지 등 — 오늘은 카운트하지 않음
+            continue
+        days = int(row.get("watch_days") or 0) + 1
+        payload = {"watch_days": days, "last_price": price, "last_date": TODAY, "updated_at": now_iso}
+        if price < sig_open:
+            payload.update({"status": "open", "pick_date": TODAY, "entry_price": price,
+                            "days_tracked": 0, "ret_cum": 0, "max_ret": 0, "min_ret": 0})
+            entered.append({**row, "entry_price": price, "watch_days": days})
+        elif days >= PULLBACK_WATCH_DAYS:
+            payload["status"] = "expired"
+            expired += 1
+        else:
+            waiting += 1
+        supabase_request("PATCH", "pullback_track", data=payload, params={"id": f"eq.{row['id']}"})
+
+    log(f"  📉 급등주 급락 감시: 매수 진입 {len(entered)} · 감시 계속 {waiting} · 만료 {expired} · 시세없음 {skipped}")
+    for e in entered:
+        log(f"     ▶ {e['name']} {e['signal_date']} 시가 {float(e['signal_open']):,.0f} 이탈 → {e['entry_price']:,.0f}원 매수 ({e['watch_days']}일째)")
+    return entered
+
+
+def seed_pullback_signals(krx_data):
+    """오늘 +10% · 거래대금 3,000억 이상 종목을 감시 목록에 등록 (오늘분 교체 → 재실행 안전).
+
+    이미 감시 중이거나 보유 중(open)인 종목은 새로 등록하지 않음.
+    """
+    if not krx_data:
+        return []
+    cands = [d for d in krx_data.values()
+             if float(d.get("change_pct", 0) or 0) >= PULLBACK_MIN_CHANGE
+             and int(d.get("trading_value", 0) or 0) >= PULLBACK_MIN_TRADING_VALUE
+             and d.get("price", 0) > 0 and not is_etf_etn(d.get("name", ""))]
+    cands.sort(key=lambda d: -int(d.get("trading_value", 0)))
+
+    supabase_request("DELETE", "pullback_track", params={"signal_date": f"eq.{TODAY}", "status": "eq.watch"})
+    if not cands:
+        log("  ℹ️ 오늘 +10% · 거래대금 3,000억 이상 종목 없음 — 급등주 급락 감시 등록 없음")
+        return []
+    active = {r["code"] for r in (supabase_request("GET", "pullback_track", params={
+        "status": "in.(watch,open)", "signal_date": f"neq.{TODAY}", "select": "code"}) or [])}
+
+    rows, skipped = [], []
+    for rank, d in enumerate(cands, 1):
+        if d["code"] in active:
+            skipped.append(d.get("name", d["code"]))
+            continue
+        op = _fetch_naver_today_open(d["code"])
+        if op <= 0:
+            log(f"  ⚠️ {d.get('name')} 시가 조회 실패 — 감시 등록 제외")
+            continue
+        rows.append({
+            "signal_date": TODAY, "code": d["code"], "name": d.get("name", ""),
+            "market": d.get("market", ""), "display_sector": d.get("display_sector", ""),
+            "rank": rank, "signal_open": op, "signal_close": float(d["price"]),
+            "signal_change": round(float(d.get("change_pct", 0)), 2),
+            "trading_value": int(d.get("trading_value", 0)), "market_cap": int(d.get("market_cap", 0)),
+            "watch_days": 0, "last_price": float(d["price"]), "last_date": TODAY, "status": "watch",
+        })
+    if skipped:
+        log(f"  ⏭ 이미 감시·보유 중이라 새 신호 제외: {', '.join(skipped)}")
+    if not rows:
+        return []
+    result = supabase_request("POST", "pullback_track", data=rows)
+    log(f"  📉 급등주 급락 감시 등록 {len(rows)}종목 {'✅' if result else '❌'}: "
+        + ", ".join(f"{r['name']} {r['signal_change']:+.1f}% (시가 {r['signal_open']:,.0f})" for r in rows))
+    return rows if result else []
+
+
+# ─────────────────────────────────────────
+# 카카오톡 알림 ("나에게 보내기")
+#   refresh token 은 Supabase app_secrets 에 보관 (setup_kakao.sql + kakao_setup.py 로 최초 1회 저장)
+#   매 발송 때 refresh token 으로 access token 을 새로 받고, 새 refresh token 이 오면 다시 저장
+# ─────────────────────────────────────────
+KAKAO_TEXT_LIMIT = 200   # 텍스트 템플릿 최대 글자 수
+_kakao_access = None
+
+
+def _kakao_secret_get(key):
+    rows = supabase_request("GET", "app_secrets", params={"key": f"eq.{key}", "select": "value"})
+    return rows[0]["value"] if rows else ""
+
+
+def _kakao_secret_set(key, value):
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/app_secrets", headers={
+            "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+        }, json=[{"key": key, "value": value, "updated_at": datetime.now(timezone.utc).isoformat()}], timeout=15)
+        return r.status_code < 300
+    except Exception as e:
+        log(f"  ⚠️ 카카오 토큰 저장 실패: {e}")
+        return False
+
+
+def _kakao_token():
+    """refresh token 으로 access token 발급 (실행당 1회). 실패하면 None."""
+    global _kakao_access
+    if _kakao_access:
+        return _kakao_access
+    if not KAKAO_REST_API_KEY:
+        return None
+    refresh = _kakao_secret_get("kakao_refresh_token")
+    if not refresh:
+        log("  ⚠️ 카카오 refresh token 없음 — kakao_setup.py 로 최초 연결 필요")
+        return None
+    data = {"grant_type": "refresh_token", "client_id": KAKAO_REST_API_KEY, "refresh_token": refresh}
+    if KAKAO_CLIENT_SECRET:
+        data["client_secret"] = KAKAO_CLIENT_SECRET
+    try:
+        r = requests.post("https://kauth.kakao.com/oauth/token", data=data, timeout=15)
+        tok = r.json()
+    except Exception as e:
+        log(f"  ⚠️ 카카오 토큰 갱신 실패: {e}")
+        return None
+    if "access_token" not in tok:
+        log(f"  ⚠️ 카카오 토큰 갱신 실패 (다시 kakao_setup.py 실행 필요할 수 있음): {str(tok)[:200]}")
+        return None
+    if tok.get("refresh_token"):   # 만료 1개월 이내면 새 refresh token 이 옴 → 저장해야 계속 연장됨
+        ok = _kakao_secret_set("kakao_refresh_token", tok["refresh_token"])
+        log(f"  🔑 카카오 refresh token 갱신 저장 {'✅' if ok else '❌'}")
+    _kakao_access = tok["access_token"]
+    return _kakao_access
+
+
+def _kakao_chunks(lines, title):
+    """줄 목록을 200자 이하 메시지들로 나눔 (메시지마다 제목 줄 반복)."""
+    msgs, cur = [], title
+    for ln in lines:
+        ln = ln if len(ln) <= KAKAO_TEXT_LIMIT - len(title) - 2 else ln[:KAKAO_TEXT_LIMIT - len(title) - 3] + "…"
+        if len(cur) + 1 + len(ln) > KAKAO_TEXT_LIMIT:
+            msgs.append(cur)
+            cur = title
+        cur += "\n" + ln
+    if cur != title:
+        msgs.append(cur)
+    return msgs
+
+
+def kakao_send(text, link=None, button="사이트에서 보기"):
+    """카카오톡 '나와의 채팅'으로 텍스트 1건 전송. 링크 도메인은 카카오 앱에 등록된 사이트만 동작."""
+    token = _kakao_token()
+    if not token:
+        return False
+    link = link or SITE_URL
+    template = {"object_type": "text", "text": text[:KAKAO_TEXT_LIMIT],
+                "link": {"web_url": link, "mobile_web_url": link}, "button_title": button}
+    try:
+        r = requests.post("https://kapi.kakao.com/v2/api/talk/memo/default/send",
+                          headers={"Authorization": f"Bearer {token}"},
+                          data={"template_object": json.dumps(template, ensure_ascii=False)}, timeout=15)
+        if r.status_code != 200:
+            log(f"  ⚠️ 카카오톡 전송 실패: {r.status_code} {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log(f"  ⚠️ 카카오톡 전송 실패: {e}")
+        return False
+
+
+def notify_track_kakao(leader_new, oversold_new, closed, pullback_new=None):
+    """성과 추적 편입·매도를 카카오톡으로 알림. 보낼 게 없으면 아무것도 안 보냄. 실패해도 크롤링엔 영향 없음."""
+    if not KAKAO_REST_API_KEY or not (leader_new or oversold_new or closed or pullback_new):
+        return 0
+    try:
+        now_kst = datetime.now(timezone(timedelta(hours=9)))
+        md = f"{now_kst.month}/{now_kst.day}"
+        page = f"{SITE_URL}/#issues"
+        sent = 0
+        # 주도주: 종목마다 1건 (테마·동반 종목·뉴스 제목)
+        for i, r in enumerate(leader_new or [], 1):
+            mates = [f"{t['name']} {t['change_pct']:+.1f}%" for t in (r.get("theme_stocks") or []) if t.get("code") != r["code"]][:3]
+            news = (r.get("news_list") or [])
+            lines = [f"🔥 주도주 편입 {md} ({i}/{len(leader_new)})",
+                     f"{r['name']} {r['change_pct']:+.2f}% · 종가 {r['entry_price']:,.0f}원",
+                     f"테마: {r['theme_name']} (동반 {r['theme_count']}종목)"]
+            if mates:
+                lines.append("함께: " + ", ".join(mates))
+            if news:
+                lines.append("📰 " + news[0].get("title", ""))
+            lines.append("매도: 종가 10일선 이탈 시")
+            text = "\n".join(lines)
+            if len(text) > KAKAO_TEXT_LIMIT:
+                text = text[:KAKAO_TEXT_LIMIT - 1] + "…"
+            sent += kakao_send(text, page, "테마·뉴스 보기")
+        # 과대 낙폭: 한 메시지에 묶음 (200자 넘으면 나눔)
+        if oversold_new:
+            lines = [f"{r['name']} MA20 {float(r.get('deviation') or 0):+.1f}% · {r['entry_price']:,.0f}원" for r in oversold_new]
+            for m in _kakao_chunks(lines, f"▼ 과대 낙폭 편입 {md} · {len(oversold_new)}종목"):
+                sent += kakao_send(m, page)
+        # 급등주 급락 매수 진입
+        if pullback_new:
+            lines = [f"{r['name']} {r['signal_date'][5:]} 급등({float(r.get('signal_change') or 0):+.1f}%) 시가 "
+                     f"{float(r['signal_open']):,.0f} 이탈 · {r['entry_price']:,.0f}원 매수 ({r['watch_days']}일째)" for r in pullback_new]
+            for m in _kakao_chunks(lines, f"📉 급등주 급락 매수 {md} · {len(pullback_new)}종목 (±10%)"):
+                sent += kakao_send(m, page)
+        # 매도(마감)
+        if closed:
+            lines = [f"[{c['kind']}] {c['name']} {c['ret']:+.2f}% {'익절' if c['result'] == 'win' else '손절'} · {c['reason']} · {c['days']}일"
+                     for c in closed]
+            for m in _kakao_chunks(lines, f"📤 매도 {md} · {len(closed)}건"):
+                sent += kakao_send(m, page)
+        log(f"  💬 카카오톡 알림 {sent}건 전송")
+        return sent
+    except Exception as e:
+        log(f"  ⚠️ 카카오톡 알림 실패 (크롤링은 계속): {e}")
+        return 0
+
+
+# ─────────────────────────────────────────
+# 3. 시장 지수 (Yahoo Finance API)
+# ─────────────────────────────────────────
+def crawl_market_index():
+    """시장 지수 + 환율 조회 (한국: 네이버+Yahoo 스파크라인, 해외: Yahoo)"""
+    log("📊 시장 지수 크롤링 시작...")
+
+    indices = []
+
+    # naver_code가 있으면 네이버에서 가격/등락 조회, Yahoo는 스파크라인만
+    index_symbols = [
+        ("코스피",   "^KS11",    "5m", "KOSPI"),
+        ("코스닥",   "^KQ11",    "5m", "KOSDAQ"),
+        ("다우존스", "^DJI",     "5m", None),
+        ("나스닥",   "^IXIC",    "5m", None),
+        ("S&P 500",  "^GSPC",    "5m", None),
+        ("USD/KRW",  "USDKRW=X", "5m", None),
+    ]
+
+    for name, symbol, interval, naver_code in index_symbols:
+        try:
+            # Yahoo에서 스파크라인 데이터 (+ 해외지수는 가격도)
+            price, prev, sparkline = fetch_yahoo_chart(symbol, interval)
+
+            # 한국 지수: 네이버에서 정확한 가격/등락 데이터
+            if naver_code:
+                naver = fetch_naver_index_basic(naver_code)
+                if naver:
+                    n_price, n_change, n_pct, n_trend = naver
+                    indices.append({
+                        "name": name,
+                        "value": f"{n_price:,.2f}",
+                        "change_amount": f"{n_change:+,.2f}",
+                        "change_pct": f"{n_pct:+.2f}%",
+                        "trend": n_trend,
+                        "sparkline_data": {"v": sparkline},
+                    })
+                    log(f"  ✅ {name}: {n_price:,.2f} ({n_pct:+.2f}%) (네이버, 스파크라인 {len(sparkline)}pt)")
+                    continue
+                log(f"  ⚠️ {name} 네이버 실패 → Yahoo 폴백")
+
+            # 해외 지수 또는 네이버 실패 시 Yahoo 데이터
+            if prev and prev > 0:
+                change = round(price - prev, 2)
+                pct = round((change / prev) * 100, 2)
+                trend = "down" if change < 0 else ("flat" if change == 0 else "up")
+
+                indices.append({
+                    "name": name,
+                    "value": f"{price:,.2f}",
+                    "change_amount": f"{change:+,.2f}",
+                    "change_pct": f"{pct:+.2f}%",
+                    "trend": trend,
+                    "sparkline_data": {"v": sparkline},
+                })
+            else:
+                indices.append({
+                    "name": name,
+                    "value": f"{price:,.2f}",
+                    "change_amount": "0",
+                    "change_pct": "0.00%",
+                    "trend": "up",
+                    "sparkline_data": {"v": sparkline},
+                })
+            log(f"  ✅ {name}: {price:,.2f} (스파크라인 {len(sparkline)}포인트)")
+        except Exception as ex:
+            log(f"  ⚠️ {name} ({symbol}) 조회 실패: {ex}")
+
+    log(f"  ✅ 시장 지수 {len(indices)}개 수집 완료")
+    return indices
+
+
+# ─────────────────────────────────────────
+# 4. 섹터 데이터 (KRX 업종 기반)
+# ─────────────────────────────────────────
+def crawl_sectors(krx_data):
+    """KRX 데이터에서 섹터별 등락률 계산"""
+    log("🏭 섹터 데이터 크롤링 시작...")
+
+    sector_stats = {}
+    for code, d in krx_data.items():
+        sector = d["display_sector"]
+        if not sector or sector not in SECTOR_ICONS:
+            continue
+        if d["price"] == 0 or is_etf_etn(d["name"]):
+            continue
+
+        if sector not in sector_stats:
+            sector_stats[sector] = {"changes": [], "stocks": []}
+        sector_stats[sector]["changes"].append(d["change_pct"])
+        sector_stats[sector]["stocks"].append(d)
+
+    sectors = []
+    for sname, icon in SECTOR_ICONS.items():
+        stats = sector_stats.get(sname, {"changes": [], "stocks": []})
+
+        if stats["changes"]:
+            avg_pct = sum(stats["changes"]) / len(stats["changes"])
+        else:
+            avg_pct = 0.0
+
+        if avg_pct > 0.005:
+            trend = "up"
+            pct_str = f"+{avg_pct:.2f}%"
+        elif avg_pct < -0.005:
+            trend = "down"
+            pct_str = f"{avg_pct:.2f}%"
+        else:
+            trend = "flat"
+            pct_str = "0.00%"
+
+        # 상승률 최고 종목
+        top_stock = ""
+        best_pct = -999
+        for s in stats["stocks"]:
+            if s["change_pct"] > best_pct:
+                best_pct = s["change_pct"]
+                top_stock = s["name"]
+
+        sectors.append({
+            "name": sname,
+            "change_pct": pct_str,
+            "trend": trend,
+            "stock_count": len(stats["changes"]),
+            "icon": icon,
+            "top_stock": top_stock,
+            "description": "",
+        })
+
+    log(f"  ✅ 섹터 {len(sectors)}개 수집 완료")
+    return sectors
+
+
+# ─────────────────────────────────────────
+# 5. 섹터별 종목 (KRX 시가총액 기반)
+# ─────────────────────────────────────────
+def crawl_sector_stocks(krx_data):
+    """KRX 데이터에서 섹터별 종목 목록 생성 (시가총액 상위)"""
+    log("🏷️ 섹터별 종목 크롤링 시작...")
+
+    # 섹터별 그룹핑
+    sector_groups = {}
+    for code, d in krx_data.items():
+        sector = d["display_sector"]
+        if not sector or sector not in SECTOR_ICONS:
+            continue
+        if d["price"] == 0 or is_etf_etn(d["name"]):
+            continue
+        if sector not in sector_groups:
+            sector_groups[sector] = []
+        sector_groups[sector].append(d)
+
+    all_stocks = []
+    for sector_name in SECTOR_ICONS.keys():
+        stocks_in_sector = sector_groups.get(sector_name, [])
+        # 시가총액 순 정렬
+        stocks_in_sector.sort(key=lambda x: x["market_cap"], reverse=True)
+
+        for rank_idx, d in enumerate(stocks_in_sector[:10], 1):
+            cp = d["change_pct"]
+
+            if cp > 0.005:
+                trend = "up"
+                pct_str = f"+{cp:.2f}%"
+            elif cp < -0.005:
+                trend = "down"
+                pct_str = f"{cp:.2f}%"
+            else:
+                trend = "flat"
+                pct_str = "0.00%"
+
+            try:
+                price_formatted = f"{d['price']:,}"
+            except:
+                price_formatted = str(d["price"])
+
+            all_stocks.append({
+                "sector_name": sector_name,
+                "stock_name": d["name"],
+                "code": d["code"],
+                "price": price_formatted,
+                "change_pct": pct_str,
+                "trend": trend,
+                "rank": rank_idx,
+            })
+
+        log(f"  ✅ {sector_name}: {min(len(stocks_in_sector), 10)}개 종목 수집")
+
+    log(f"  ✅ 섹터별 종목 총 {len(all_stocks)}개 수집 완료")
+    return all_stocks
+
+
+# ─────────────────────────────────────────
+# 6. 테마 (AI 동적 감지 + KRX + 네이버 검색 API)
+# ─────────────────────────────────────────
+def crawl_themes(krx_data, news_titles=None, theme_map=None):
+    """AI가 선정한 테마의 종목을 KRX 데이터에서 조회하여 성과 계산"""
+    log("🔥 테마 크롤링 시작...")
+
+    # 일 1회: 신규 테마 자동 발굴 (기존 테마에 없는 새로운 트렌드)
+    if news_titles and krx_data and theme_map:
+        discover_new_themes(news_titles, krx_data, theme_map)
+
+    # 주 1회: Groq AI로 테마 감지 / 나머지: 규칙 기반 키워드 매칭
+    if _should_run_ai_themes():
+        log("  🤖 AI 테마 감지 실행 (주 1회)")
+        ai_themes = detect_themes_with_ai(news_titles, theme_map)
+        if not ai_themes:
+            log("  ↩️ AI 실패 → 규칙 기반 폴백")
+            ai_themes = detect_themes_rule_based(news_titles, theme_map, krx_data)
+    else:
+        ai_themes = detect_themes_rule_based(news_titles, theme_map, krx_data)
+
+    if ai_themes:
+        # ── AI 테마: KRX 데이터에서 직접 가격 조회 ──
+        # (종목은 매핑 DB에서 시총 3000억+ 필터 적용 완료)
+        themes = []
+        for theme_def in ai_themes:
+            theme_stocks = []
+            changes = []
+            seen_codes = set()
+
+            for s in theme_def["stocks"]:
+                code = s["code"]
+                if code in seen_codes:
+                    continue
+                seen_codes.add(code)
+
+                d = krx_data.get(code)
+                if not d:
+                    continue
+
+                cp = d["change_pct"]
+                changes.append(cp)
+                theme_stocks.append({"name": d["name"], "code": code, "change_pct": cp, "trading_value": d.get("trading_value", 0)})
+
+            if len(theme_stocks) < 3:
+                log(f"  ⏭️ 종목 부족으로 테마 스킵: {theme_def['name']} ({len(theme_stocks)}개)")
+                continue
+
+            avg_change = sum(changes) / len(changes) if changes else 0.0
+            up_count = sum(1 for c in changes if c > 0.005)
+            down_count = sum(1 for c in changes if c < -0.005)
+            flat_count = len(changes) - up_count - down_count
+
+            if avg_change > 0.005:
+                trend, pct_str = "up", f"+{avg_change:.2f}%"
+            elif avg_change < -0.005:
+                trend, pct_str = "down", f"{avg_change:.2f}%"
+            else:
+                trend, pct_str = "flat", "0.00%"
+
+            # 복합 점수: 등락률 절대값 50% + 거래대금 50% (정규화)
+            max_abs_chg = max((abs(ts["change_pct"]) for ts in theme_stocks), default=1) or 1
+            max_tv = max((ts["trading_value"] for ts in theme_stocks), default=1) or 1
+            for ts in theme_stocks:
+                base = (abs(ts["change_pct"]) / max_abs_chg) * 50 + (ts["trading_value"] / max_tv) * 50
+                rel = _score_theme_stock_relevance(ts["name"], ts["change_pct"], theme_def["name"], avg_change, news_titles)
+                ts["_rel"] = rel
+                # 관련도 가중치: 60 이상 full, 낮으면 20%까지 감점
+                w = max(0.2, min(1.0, rel / 60.0))
+                ts["_score"] = base * w
+
+            # 하드 필터: 관련도 15 미만은 명백한 이탈자 → 제외 (최소 3개 확보)
+            filtered = [ts for ts in theme_stocks if ts["_rel"] >= 15]
+            if len(filtered) >= 3:
+                dropped = [ts["name"] for ts in theme_stocks if ts["_rel"] < 15]
+                if dropped:
+                    log(f"     [{theme_def['name']}] 관련도 낮아 제외: {', '.join(dropped[:5])}")
+                theme_stocks = filtered
+
+            theme_stocks.sort(key=lambda x: x["_score"], reverse=True)
+            leaders = []
+            for ts in theme_stocks[:10]:
+                cp = ts["change_pct"]
+                pct_display = f"+{cp:.2f}%" if cp >= 0 else f"{cp:.2f}%"
+                leaders.append(f"{ts['name']}:{ts['code']}:{pct_display}")
+
+            # 네이버 뉴스 검색
+            search_kw = theme_def.get("search_query", theme_def["name"] + " 주식")
+            news_title, news_url, news_list_json = _search_theme_news_api(search_kw, theme_def["name"])
+
+            themes.append({
+                "rank": 0, "name": theme_def["name"], "change_pct": pct_str,
+                "avg_3day_pct": "", "up_count": up_count, "flat_count": flat_count,
+                "down_count": down_count, "leading_stocks": ", ".join(leaders),
+                "related_news": news_title, "news_url": news_url,
+                "news_list": news_list_json,
+                "trend": trend, "date": TODAY,
+            })
+
+    else:
+        # ── Fallback: 정적 THEME_DEFINITIONS (KRX 데이터 기반) ──
+        log("  📋 정적 테마 정의 사용")
+        themes = []
+        for theme_def in THEME_DEFINITIONS:
+            theme_stocks = []
+            changes = []
+            for code in theme_def["stocks"]:
+                d = krx_data.get(code)
+                if not d:
+                    continue
+                cp = d["change_pct"]
+                changes.append(cp)
+                theme_stocks.append({"name": d["name"], "code": code, "change_pct": cp, "trading_value": d.get("trading_value", 0)})
+
+            avg_change = sum(changes) / len(changes) if changes else 0.0
+            up_count = sum(1 for c in changes if c > 0.005)
+            down_count = sum(1 for c in changes if c < -0.005)
+            flat_count = len(changes) - up_count - down_count
+
+            if avg_change > 0.005:
+                trend, pct_str = "up", f"+{avg_change:.2f}%"
+            elif avg_change < -0.005:
+                trend, pct_str = "down", f"{avg_change:.2f}%"
+            else:
+                trend, pct_str = "flat", "0.00%"
+
+            # 복합 점수 + 관련도 필터 (Phase 1)
+            max_abs_chg = max((abs(ts["change_pct"]) for ts in theme_stocks), default=1) or 1
+            max_tv = max((ts["trading_value"] for ts in theme_stocks), default=1) or 1
+            for ts in theme_stocks:
+                base = (abs(ts["change_pct"]) / max_abs_chg) * 50 + (ts["trading_value"] / max_tv) * 50
+                rel = _score_theme_stock_relevance(ts["name"], ts["change_pct"], theme_def["name"], avg_change, news_titles)
+                ts["_rel"] = rel
+                w = max(0.2, min(1.0, rel / 60.0))
+                ts["_score"] = base * w
+
+            filtered = [ts for ts in theme_stocks if ts["_rel"] >= 15]
+            if len(filtered) >= 3:
+                dropped = [ts["name"] for ts in theme_stocks if ts["_rel"] < 15]
+                if dropped:
+                    log(f"     [{theme_def['name']}] 관련도 낮아 제외: {', '.join(dropped[:5])}")
+                theme_stocks = filtered
+
+            theme_stocks.sort(key=lambda x: x["_score"], reverse=True)
+            leaders = []
+            for ts in theme_stocks[:10]:
+                cp = ts["change_pct"]
+                pct_display = f"+{cp:.2f}%" if cp >= 0 else f"{cp:.2f}%"
+                leaders.append(f"{ts['name']}:{ts['code']}:{pct_display}")
+
+            news_title, news_url, news_list_json = _search_theme_news_api(theme_def["search_query"], theme_def["name"])
+            themes.append({
+                "rank": 0, "name": theme_def["name"], "change_pct": pct_str,
+                "avg_3day_pct": "", "up_count": up_count, "flat_count": flat_count,
+                "down_count": down_count, "leading_stocks": ", ".join(leaders),
+                "related_news": news_title, "news_url": news_url,
+                "news_list": news_list_json,
+                "trend": trend, "date": TODAY,
+            })
+
+    # 등락률 높은 순으로 랭킹 (상승 테마 우선)
+    themes.sort(key=lambda t: float(t["change_pct"].replace("%", "").replace("+", "")), reverse=True)
+    for i, t in enumerate(themes, 1):
+        t["rank"] = i
+
+    log(f"  ✅ 테마 {len(themes)}개 수집 완료")
+    return themes
+
+
+def build_all_themes_data(krx_data, theme_map, top_theme_names):
+    """theme_map의 전체 테마를 KRX 데이터로 enrichment (뉴스 제외, 종목+등락률만)"""
+    log("📊 전체 테마 데이터 구축 중...")
+    all_themes = []
+    top_set = set(top_theme_names)
+
+    for theme_name, stocks in theme_map.items():
+        changes = []
+        theme_stocks = []
+        seen_codes = set()
+
+        for s in stocks:
+            code = s["code"]
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+
+            d = krx_data.get(code)
+            if not d:
+                continue
+
+            cp = d["change_pct"]
+            changes.append(cp)
+            theme_stocks.append({"name": d["name"], "code": code, "change_pct": cp, "trading_value": d.get("trading_value", 0)})
+
+        if len(theme_stocks) < 3:
+            continue
+
+        avg_change = sum(changes) / len(changes) if changes else 0.0
+        up_count = sum(1 for c in changes if c > 0.005)
+        down_count = sum(1 for c in changes if c < -0.005)
+        flat_count = len(changes) - up_count - down_count
+
+        if avg_change > 0.005:
+            trend, pct_str = "up", f"+{avg_change:.2f}%"
+        elif avg_change < -0.005:
+            trend, pct_str = "down", f"{avg_change:.2f}%"
+        else:
+            trend, pct_str = "flat", "0.00%"
+
+        # 복합 점수: 등락률 절대값 50% + 거래대금 50% (정규화)
+        max_abs_chg = max((abs(ts["change_pct"]) for ts in theme_stocks), default=1) or 1
+        max_tv = max((ts["trading_value"] for ts in theme_stocks), default=1) or 1
+        for ts in theme_stocks:
+            ts["_score"] = (abs(ts["change_pct"]) / max_abs_chg) * 50 + (ts["trading_value"] / max_tv) * 50
+        theme_stocks.sort(key=lambda x: x["_score"], reverse=True)
+        leaders = []
+        for ts in theme_stocks[:10]:
+            cp = ts["change_pct"]
+            pct_display = f"+{cp:.2f}%" if cp >= 0 else f"{cp:.2f}%"
+            leaders.append(f"{ts['name']}:{ts['code']}:{pct_display}")
+
+        all_themes.append({
+            "rank": 0,
+            "name": theme_name,
+            "change_pct": pct_str,
+            "up_count": up_count,
+            "flat_count": flat_count,
+            "down_count": down_count,
+            "leading_stocks": ", ".join(leaders),
+            "stock_count": len(theme_stocks),
+            "trend": trend,
+            "is_top": theme_name in top_set,
+            "date": TODAY,
+        })
+
+    # 등락률 순 정렬 + rank 부여
+    all_themes.sort(key=lambda t: float(t["change_pct"].replace("%", "").replace("+", "")), reverse=True)
+    for i, t in enumerate(all_themes, 1):
+        t["rank"] = i
+
+    log(f"  ✅ 전체 테마 {len(all_themes)}개 구축 완료 (TOP {len(top_set)}개 포함)")
+    return all_themes
+
+
+def save_theme_all_stocks(krx_data, theme_map):
+    """theme_map의 모든 테마 × 모든 종목을 개별 행으로 저장 (테마 상세 페이지용)"""
+    log("📊 전체 테마 종목 데이터 구축 중...")
+    rows = []
+
+    for theme_name, stocks in theme_map.items():
+        theme_stocks = []
+        seen_codes = set()
+
+        for s in stocks:
+            code = s["code"]
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+
+            d = krx_data.get(code)
+            if not d:
+                continue
+
+            cp = d["change_pct"]
+            theme_stocks.append({
+                "name": d["name"], "code": code,
+                "change_pct": cp, "trading_value": d.get("trading_value", 0),
+                "price": d.get("price", ""), "change_amount": d.get("change_amount", ""),
+            })
+
+        if len(theme_stocks) < 1:
+            continue
+
+        # 복합 점수 기준 rank (기존 패턴 재사용)
+        max_abs_chg = max((abs(ts["change_pct"]) for ts in theme_stocks), default=1) or 1
+        max_tv = max((ts["trading_value"] for ts in theme_stocks), default=1) or 1
+        for ts in theme_stocks:
+            ts["_score"] = (abs(ts["change_pct"]) / max_abs_chg) * 50 + (ts["trading_value"] / max_tv) * 50
+        theme_stocks.sort(key=lambda x: x["_score"], reverse=True)
+
+        for rank, ts in enumerate(theme_stocks, 1):
+            cp = ts["change_pct"]
+            pct_display = f"+{cp:.2f}%" if cp >= 0 else f"{cp:.2f}%"
+            trend = "up" if cp > 0.005 else ("down" if cp < -0.005 else "flat")
+            rows.append({
+                "theme_name": theme_name,
+                "code": ts["code"],
+                "name": ts["name"],
+                "price": str(ts["price"]),
+                "change_pct": pct_display,
+                "change_amount": str(ts["change_amount"]),
+                "trading_value": int(ts["trading_value"]),
+                "trend": trend,
+                "rank": rank,
+                "date": TODAY,
+            })
+
+    log(f"  ✅ 전체 테마 종목 {len(rows)}개 구축 완료")
+    return rows
+
+
+# ─────────────────────────────────────────
+# 메인 실행
+# ─────────────────────────────────────────
+def main():
+    log("=" * 50)
+    log("🚀 STOCKPULSE 크롤러 시작")
+    log(f"📅 날짜: {TODAY}")
+    log("=" * 50)
+
+    # 실행 모드 판정 (크롤링 전에 미리 결정 — 크롤링 소요시간으로 인한 타이밍 누락 방지)
+    #   close = 장 마감 후(15:35/16:00): 종목·테마 분석, 과대 낙폭·재료 포착·성과 추적
+    kst_start = datetime.now(timezone(timedelta(hours=9)))
+    run_schedule = [(15, 35, 15, "close"), (16, 0, 15, "close")]
+    ai_mode = None
+    for h, m, tolerance, mode in run_schedule:
+        if h == kst_start.hour and abs(kst_start.minute - m) <= tolerance:
+            ai_mode = mode
+            break
+    if ai_mode and kst_start.weekday() >= 5:  # 5=토, 6=일
+        ai_mode = None
+    if ai_mode:
+        log(f"  🕞 장 마감 모드 (시작 시각 {kst_start.strftime('%H:%M')})")
+
+    # 과대 낙폭 종목 장중 갱신: 평일 15:00~15:19 KST (확정 종가 전 현재 시세 기준)
+    # → close 모드(15:35/16:00)에서 확정 종가로 다시 갱신됨
+    oversold_intraday = (kst_start.weekday() < 5 and kst_start.hour == 15 and kst_start.minute < 20)
+    if oversold_intraday:
+        log(f"  📉 과대 낙폭 장중 갱신 모드 (시작 시각 {kst_start.strftime('%H:%M')})")
+
+    if not SUPABASE_KEY:
+        log("❌ SUPABASE_KEY 환경변수가 설정되지 않았습니다!")
+        log("  export SUPABASE_KEY='your-service-role-key'")
+        return
+
+    # 수동 실행 "카카오톡 테스트" — 연결 확인용 메시지 1건 (크롤링은 그대로 진행)
+    if KAKAO_TEST:
+        ok = kakao_send("🔔 STOCKPULSE 카카오톡 알림 테스트\n이 메시지가 보이면 GitHub Actions → 카카오톡 연결 정상입니다.")
+        log(f"  💬 카카오톡 테스트 메시지 {'✅' if ok else '❌ (KAKAO_REST_API_KEY / app_secrets 확인)'}")
+
+    # 1. 섹터 매핑 조회 (네이버 업종별 종목, 일 1회 캐시)
+    sector_map = fetch_naver_sector_map()
+    log(f"  📋 섹터 매핑: {len(sector_map)}개 종목")
+
+    # 2. 전종목 시세 조회 (네이버 금융 → KRX fallback)
+    krx_data = fetch_naver_market_data(sector_map)
+    if not krx_data:
+        log("  ⚠️ 네이버 금융 실패 - KRX fallback 시도...")
+        krx_data = fetch_krx_market_data()
+    if not krx_data:
+        log("❌ 시세 데이터 조회 실패 - 크롤링 중단")
+        return
+
+    # 휴장일 판별 (평일이지만 한국 시장이 안 열린 날 — 공휴일/임시휴장)
+    # 전종목 상위 200개 중 등락률 0이 아닌 종목이 하나도 없으면 휴장으로 간주
+    is_weekday = kst_start.weekday() < 5
+    is_trading_day = is_weekday and any(
+        abs(s.get("change_pct", 0)) > 0 for s in list(krx_data.values())[:200]
+    )
+    if is_weekday and not is_trading_day:
+        log(f"  🏖️ 평일이지만 한국 시장 휴장일로 판단됨 (전종목 등락률 0)")
+        # 장 마감 분석(종목/테마 분석, 과대 낙폭 등) 스킵
+        if ai_mode:
+            log("     → 장 마감 분석 스킵")
+            ai_mode = None
+        # 과대 낙폭 장중 갱신 스킵 (확정 종가도 없으므로 daily_prices 누적도 안 함)
+        if oversold_intraday:
+            log(f"     → 과대 낙폭 장중 갱신 스킵")
+            oversold_intraday = False
+
+    # 3. 종목코드 매핑 구축 (AI 테마 코드 보정용)
+    global KNOWN_STOCK_CODES
+    KNOWN_STOCK_CODES = build_stock_code_map(krx_data)
+    log(f"  📋 종목코드 매핑: {len(KNOWN_STOCK_CODES)}개 종목")
+
+    # 4. 뉴스 (네이버 검색 API)
+    news = crawl_news()
+
+    # 5. 시장 지수 (Yahoo Finance API — 지수/환율만)
+    indices = crawl_market_index()
+
+    # 6. 섹터 데이터 (KRX 업종 기반)
+    sectors = crawl_sectors(krx_data)
+
+    # 7. 섹터별 종목 (KRX 시가총액 기반)
+    sector_stocks = crawl_sector_stocks(krx_data)
+
+    # 8. 테마-종목 매핑 DB 구축 (기업개요 기반, 하루 1회 캐싱)
+    #    (종목 태그용 짧은 분류 stock_themes는 계속 이 방식)
+    theme_map, stock_themes = build_theme_stock_map(krx_data)
+
+    # 8-1. 인기 테마·전체 테마·주도주는 네이버 테마 기준 (하루 1번 갱신, 편입/편출 자동 반영)
+    #      네이버를 못 받으면 저장본 → 없으면 위 기업개요 기반 theme_map 그대로
+    global NAVER_THEME_ACTIVE
+    try:
+        naver_map = build_naver_theme_map(krx_data)
+    except Exception as e:
+        log(f"  ⚠️ 네이버 테마 사용 실패: {e}")
+        naver_map = None
+    if naver_map:
+        theme_map = naver_map
+        NAVER_THEME_ACTIVE = True
+        log(f"  🏷️ 테마 기준: 네이버 테마 {len(theme_map)}개")
+    else:
+        log("  🏷️ 테마 기준: 기업개요 키워드 (네이버 테마 없음)")
+
+    # 9. 테마 (AI 핫테마 선정 + 매핑 DB 종목 조회)
+    news_titles = [n["title"] for n in news]
+    themes = crawl_themes(krx_data, news_titles, theme_map)
+
+    # 9-1. 전체 테마 데이터 구축 (theme_map 전체를 KRX 데이터로 enrichment)
+    top_theme_names = [t["name"] for t in themes] if themes else []
+    all_themes_data = build_all_themes_data(krx_data, theme_map, top_theme_names)
+
+    # 9-2. 전체 테마 종목 개별 저장 (테마 상세 페이지용)
+    theme_all_stocks = save_theme_all_stocks(krx_data, theme_map)
+
+    # 10. 이슈 종목 (복합 점수 랭킹: 등락률+거래대금+테마+뉴스+섹터)
+    stocks = crawl_issue_stocks(krx_data, themes, sectors, news, stock_themes=stock_themes)
+
+    # 10-1. 일별 종가 누적 + 과대 낙폭 종목 (15:00 장중 + close 모드 15:35/16:00)
+    oversold = None
+    if ai_mode == "close" or oversold_intraday:
+        save_daily_close(krx_data)
+        try:
+            repair_daily_price_gaps(krx_data)   # 크롤링이 멈췄던 날 채우기 (MA20·10일선 왜곡 방지)
+        except Exception as e:
+            log(f"  ⚠️ 일봉 공백 보충 실패: {e}")
+        oversold = crawl_oversold_stocks(krx_data)
+    track_closed, leader_new, oversold_new, pullback_new = [], [], [], []
+    if ai_mode == "close":
+        # 급등주 급락: 보유 종목 갱신 → 감시 종목 진입 판정 → 오늘 급등 종목 감시 등록
+        try:
+            track_closed += update_pullback_track(krx_data) or []
+            pullback_new = update_pullback_watch(krx_data) or []
+            seed_pullback_signals(krx_data)
+        except Exception as e:
+            log(f"  ⚠️ 급등주 급락 추적 실패 (계속 진행): {e}")
+        # 과대 낙폭 성과 추적: 기존 종목을 오늘 종가로 먼저 갱신(익절/손절 판정) → 저장 단계에서 오늘분 편입
+        track_closed += update_oversold_track(krx_data) or []
+        # 주도주 배팅: 기존 종목 갱신 → 오늘 주도 테마 대장 편입 (확정 종가 기준)
+        track_closed += update_leader_track(krx_data) or []
+        leader_new = seed_leader_track(select_leader_stocks(krx_data, theme_map)) or []
+
+    # 10-2. 재료 포착 TOP 10 (close 모드에서만 — DART/뉴스 API 비용 + 확정 종가 필요)
+    #        FORCE_CATALYST=1 이면 시간대·중복 여부 무관하게 강제 산출 (수동 실행/테스트용)
+    catalysts = None
+    if ai_mode == "close" or FORCE_CATALYST:
+        existing_cat = supabase_request("GET", "catalyst_stocks", params={
+            "date": f"eq.{TODAY}", "select": "id", "limit": "1"
+        })
+        if existing_cat and not FORCE_CATALYST:
+            log("  ℹ️ 재료 포착 종목 이미 산출됨 — 스킵")
+        else:
+            if FORCE_CATALYST:
+                log("  ⚡ FORCE_CATALYST — 시간대 무관 강제 산출")
+            # 달러 표기 계약금액을 원화로 환산하기 위한 환율 (없으면 기본값)
+            usdkrw = 1350.0
+            for idx in (indices or []):
+                if idx.get("name") == "USD/KRW":
+                    parsed_fx = _to_float(idx.get("value", ""))
+                    if parsed_fx > 0:
+                        usdkrw = parsed_fx
+                        log(f"  💱 USD/KRW {usdkrw:,.2f} 적용 (달러 표기 계약금액 환산용)")
+                    break
+            catalysts = crawl_catalyst_stocks(
+                krx_data, themes=themes, stock_themes=stock_themes, usdkrw=usdkrw
+            )
+            if catalysts:
+                catalysts = generate_catalyst_commentary(catalysts)
+
+    # 11. 종목/테마 심층 분석 (Groq, close 모드에서만)
+    stock_analysis = None
+    theme_analysis = None
+    if ai_mode:
+        # ─── 종목 심층 분석 (close 모드에서만) ───
+        if ai_mode == "close" and stocks:
+            existing_sa = supabase_request("GET", "stock_analysis", params={"date": f"eq.{TODAY}", "select": "id", "limit": "1"})
+            if existing_sa:
+                log("  ℹ️ 종목 분석 이미 생성됨 — 스킵")
+            else:
+                log("  📊 일간 종목 분석 생성 — Groq 호출")
+                stock_analysis = generate_stock_analysis(stocks, themes, sectors, news, krx_data)
+
+        # ─── 테마 심층 분석 (close 모드에서만) ───
+        if ai_mode == "close" and themes:
+            existing_ta = supabase_request("GET", "theme_analysis", params={"date": f"eq.{TODAY}", "select": "id", "limit": "1"})
+            if existing_ta:
+                log("  ℹ️ 테마 분석 이미 생성됨 — 스킵")
+            else:
+                log("  🔥 테마 심층 분석 생성 — Groq 호출")
+                theme_analysis = generate_theme_analysis(themes, sectors, news, indices)
+
+    # ─── Supabase에 저장 ───
+    log("")
+    log("💾 Supabase에 데이터 저장 중...")
+
+    # 기존 데이터 정리
+    clear_today_data("news")
+    clear_today_data("issue_stocks")
+    clear_today_data("market_index")
+    clear_today_data("sectors")
+    clear_today_data("themes")
+    # all_themes / sector_stocks / theme_stocks_all 은 아래에서 "저장 후 예전 것 삭제" (replace_table_rows)
+
+    # 뉴스 저장
+    if news:
+        result = supabase_request("POST", "news", data=news)
+        log(f"  📰 뉴스 {len(news)}개 저장 {'✅' if result else '❌'}")
+
+    # 종목 저장
+    if stocks:
+        result = supabase_request("POST", "issue_stocks", data=stocks)
+        log(f"  📈 종목 {len(stocks)}개 저장 {'✅' if result else '❌'}")
+
+    # 지수 저장 (sparkline_data는 Yahoo Finance API에서 직접 가져옴)
+    if indices:
+        result = supabase_request("POST", "market_index", data=indices)
+        log(f"  📊 지수 {len(indices)}개 저장 (sparkline 포함) {'✅' if result else '❌'}")
+
+    # 섹터 저장
+    if sectors:
+        result = supabase_request("POST", "sectors", data=sectors)
+        log(f"  🏭 섹터 {len(sectors)}개 저장 {'✅' if result else '❌'}")
+
+    # 섹터별 종목 저장
+    replace_table_rows("sector_stocks", sector_stocks, "섹터 종목")
+
+    # 테마 저장
+    if themes:
+        result = supabase_request("POST", "themes", data=themes)
+        log(f"  🔥 테마 {len(themes)}개 저장 {'✅' if result else '❌'}")
+
+    # 테마 히스토리 저장 (과거 데이터 보존 — 캘린더용, 주말+공휴일 제외)
+    if themes and is_trading_day:
+        history_data = []
+        for t in themes[:10]:
+            # leading_stocks에서 상위 3개만 추출 (저장 용량 절약)
+            ls = t.get("leading_stocks", "")
+            ls_short = ", ".join(ls.split(", ")[:3]) if ls else ""
+            history_data.append({
+                "date": TODAY, "rank": t["rank"], "name": t["name"],
+                "change_pct": t["change_pct"], "trend": t["trend"],
+                "leading_stocks": ls_short,
+                "up_count": t.get("up_count", 0),
+                "down_count": t.get("down_count", 0),
+                "flat_count": t.get("flat_count", 0),
+            })
+        supabase_request("DELETE", "theme_history", params={"date": f"eq.{TODAY}"})
+        result = supabase_request("POST", "theme_history", data=history_data)
+        log(f"  📅 테마 히스토리 {len(history_data)}개 저장 {'✅' if result else '❌'}")
+    elif is_weekday and not is_trading_day:
+        # 휴장일 마커: 캘린더에서 "휴장" 뱃지로 표시 (rank=0, name="__HOLIDAY__")
+        holiday_marker = [{
+            "date": TODAY, "rank": 0, "name": "__HOLIDAY__",
+            "change_pct": "", "trend": "flat", "leading_stocks": "",
+            "up_count": 0, "down_count": 0, "flat_count": 0,
+        }]
+        supabase_request("DELETE", "theme_history", params={"date": f"eq.{TODAY}"})
+        result = supabase_request("POST", "theme_history", data=holiday_marker)
+        log(f"  🏖️ 휴장일 마커 저장 {'✅' if result else '❌'}")
+
+    # 전체 테마 저장
+    replace_table_rows("all_themes", all_themes_data, "전체 테마")
+
+    # 전체 테마 종목 저장 (테마 상세 페이지용)
+    replace_table_rows("theme_stocks_all", theme_all_stocks, "테마 종목")
+
+    # 종목 분석 저장 (close 모드에서만)
+    if stock_analysis:
+        supabase_request("DELETE", "stock_analysis", params={"date": f"eq.{TODAY}"})
+        result = supabase_request("POST", "stock_analysis", data=[stock_analysis])
+        log(f"  📊 종목 분석 저장 {'✅' if result else '❌'}")
+
+    # 테마 분석 저장 (close 모드에서만)
+    if theme_analysis:
+        supabase_request("DELETE", "theme_analysis", params={"date": f"eq.{TODAY}"})
+        result = supabase_request("POST", "theme_analysis", data=theme_analysis)
+        log(f"  🔥 테마 분석 {len(theme_analysis)}개 저장 {'✅' if result else '❌'}")
+
+    # 과대 낙폭 종목 저장 (close 모드에서만, 오늘 데이터 교체)
+    if oversold is not None:
+        supabase_request("DELETE", "oversold_stocks", params={"date": f"eq.{TODAY}"})
+        if oversold:
+            result = supabase_request("POST", "oversold_stocks", data=oversold)
+            log(f"  📉 과대 낙폭 {len(oversold)}개 저장 {'✅' if result else '❌'}")
+        else:
+            log("  ℹ️ 과대 낙폭 종목 없음 — 빈 상태로 갱신")
+        # 성과 추적 편입은 확정 종가(close 모드)일 때만
+        if ai_mode == "close":
+            oversold_new = seed_oversold_track(oversold) or []
+
+    # 성과 추적 편입·매도 카카오톡 알림 (close 모드, 새로 생긴 것만 — 16:00 재실행 땐 중복 안 보냄)
+    if ai_mode == "close":
+        notify_track_kakao(leader_new, oversold_new, track_closed, pullback_new)
+
+    # 재료 포착 TOP 10 저장 (당일분 교체, 과거는 보존)
+    if catalysts is not None:
+        supabase_request("DELETE", "catalyst_stocks", params={"date": f"eq.{TODAY}"})
+        if catalysts:
+            result = supabase_request("POST", "catalyst_stocks", data=catalysts)
+            log(f"  🎯 재료 포착 {len(catalysts)}개 저장 {'✅' if result else '❌'}")
+        else:
+            log("  ℹ️ 재료 포착 종목 없음 — 빈 상태로 갱신")
+
+    # 90일 초과 종목/테마 분석 정리 등 (close 모드에서만)
+    if ai_mode == "close":
+        cutoff_ai = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        cutoff_sa = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "stock_analysis", params={"date": f"lt.{cutoff_sa}"})
+        supabase_request("DELETE", "theme_analysis", params={"date": f"lt.{cutoff_sa}"})
+        log(f"  🧹 {cutoff_sa} 이전 종목/테마 분석 정리")
+        supabase_request("DELETE", "theme_history", params={"date": f"lt.{cutoff_ai}"})
+        log(f"  🧹 {cutoff_ai} 이전 테마 히스토리 정리")
+        # daily_prices 75일 + oversold_stocks 90일 초과 정리
+        cutoff_dp = (datetime.now() - timedelta(days=OVERSOLD_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "daily_prices", params={"date": f"lt.{cutoff_dp}"})
+        cutoff_os = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "oversold_stocks", params={"date": f"lt.{cutoff_os}"})
+        # 재료 포착은 성과 추적 이력을 남겨야 하므로 1년 보존
+        cutoff_ct = (datetime.now() - timedelta(days=CATALYST_KEEP_DAYS)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "catalyst_stocks", params={"date": f"lt.{cutoff_ct}"})
+        # catalyst_track(재료 포착 성과 추적)은 2026-11-02부터 더 쌓이지 않음 — 기존 기록은 지우지 않고 남겨 둠
+        cutoff_ot = (datetime.now() - timedelta(days=OVERSOLD_TRACK_KEEP_DAYS)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "oversold_track", params={"pick_date": f"lt.{cutoff_ot}"})
+        cutoff_lt = (datetime.now() - timedelta(days=LEADER_TRACK_KEEP_DAYS)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "leader_track", params={"pick_date": f"lt.{cutoff_lt}"})
+        cutoff_pb = (datetime.now() - timedelta(days=PULLBACK_KEEP_DAYS)).strftime("%Y-%m-%d")
+        supabase_request("DELETE", "pullback_track", params={"signal_date": f"lt.{cutoff_pb}"})
+        log(f"  🧹 {cutoff_dp} 이전 일봉 / {cutoff_os} 이전 과대 낙폭 / {cutoff_ct} 이전 재료 포착 / {cutoff_ot} 이전 낙폭 성과 정리")
+
+    log("")
+    log("=" * 50)
+    log("✅ 크롤링 완료!")
+    log("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

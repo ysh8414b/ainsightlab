@@ -1,0 +1,60 @@
+name: 급등 종목 AI
+
+on:
+  schedule:
+    # 평일 한국시간 16:30 (UTC 07:30) — 16:00 크롤링(테마 데이터 저장) 이후
+    - cron: '30 7 * * 1-5'
+    # 예약 실행이 늦거나 빠졌을 때를 위한 보조 실행 (이미 저장된 날짜면 바로 끝남)
+    - cron: '30 10 * * 1-5'
+    - cron: '30 22 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '이미 저장된 거래일도 다시 계산'
+        type: boolean
+        default: false
+      date:
+        description: '지난 거래일 채우기 (YYYY-MM-DD, 비우면 마지막 거래일)'
+        type: string
+        default: ''
+
+jobs:
+  surge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치 (CPU용 PyTorch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy requests
+
+      - name: 일봉 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: |
+            surge_cache
+            sector_map.json
+            naver_theme_map.json
+          key: surge-cache-${{ github.run_id }}
+          restore-keys: |
+            surge-cache-
+
+      - name: 급등 종목 AI 실행
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+        run: python -u surge_ai.py ${{ inputs.force && '--force' || '' }} ${{ inputs.date && format('--date {0}', inputs.date) || '' }}

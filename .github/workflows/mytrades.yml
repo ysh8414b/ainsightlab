@@ -1,0 +1,65 @@
+name: 내 매매 분석
+
+on:
+  schedule:
+    # 평일 한국시간 17:00 (UTC 08:00) — 장 마감 후 분석
+    - cron: '0 8 * * 1-5'
+    # 보조 실행 (이미 분석한 종목은 건너뛰어 금방 끝남)
+    - cron: '0 11 * * 1-5'
+    - cron: '0 23 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '이미 분석한 종목도 다시 분석'
+        type: boolean
+        default: false
+      retrain:
+        description: '보유 모델 다시 학습 (평소엔 7일마다 자동)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: mytrades
+  cancel-in-progress: false
+
+jobs:
+  mytrades:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: .github/workflows/mytrades.yml
+
+      - name: 패키지 설치 (CPU용 PyTorch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy requests
+
+      # 급등 AI와 같은 일봉 캐시를 함께 씀 (보유 모델 파일 hold_model.pt도 여기에 저장)
+      - name: 일봉·모델 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: |
+            surge_cache
+            sector_map.json
+            naver_theme_map.json
+          key: surge-cache-${{ github.run_id }}
+          restore-keys: |
+            surge-cache-
+
+      - name: 내 매매 분석 실행
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+        run: python -u mytrades_ai.py ${{ inputs.force && '--force' || '' }} ${{ inputs.retrain && '--retrain' || '' }}

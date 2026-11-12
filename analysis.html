@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Google Analytics (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-3G7NQ8B69G"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-3G7NQ8B69G');
+  </script>
+  <title>일간 종목 리포트 — STOCKPULSE</title>
+  <meta name="description" content="STOCKPULSE AI 일간 종목 리포트. 매일 이슈 종목 TOP 5를 재료·수급·모멘텀 3축으로 심층 분석합니다." />
+  <meta property="og:title" content="일간 종목 리포트 — STOCKPULSE" />
+  <meta property="og:description" content="매일 이슈 종목 TOP 5를 재료·수급·모멘텀 3축으로 심층 분석합니다." />
+  <link rel="canonical" href="https://ainsightlab.kr/analysis.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="STOCKPULSE" />
+  <meta property="og:url" content="https://ainsightlab.kr/analysis.html" />
+  <meta property="og:locale" content="ko_KR" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="keywords" content="종목분석, 일간리포트, 이슈종목, AI종목분석, 재료분석, 수급분석, 모멘텀, 주식 추천, 종목 추천" />
+  <meta name="robots" content="noindex, nofollow" />
+  <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="shared.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useCallback}=React;
+
+function Box({children,style,hover=true}){
+  const[h,setH]=useState(false);
+  return <div style={{background:h&&hover?"var(--card-hbg)":"var(--card-bg)",border:"1px solid",borderColor:h&&hover?"var(--card-hbd)":"var(--card-bd)",borderRadius:"12px",padding:"18px 22px",transition:"all .25s",...style}} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)}>{children}</div>;
+}
+
+function Loader(){return <div style={{display:"flex",justifyContent:"center",padding:"60px 0"}}><div style={{width:28,height:28,border:"3px solid var(--div3)",borderTop:"3px solid #06b6d4",borderRadius:"50%",animation:"spin 1s linear infinite"}}/></div>}
+
+// 날짜 유틸
+function formatDate(d){return d.toISOString().slice(0,10)}
+function addDays(d,n){const r=new Date(d);r.setDate(r.getDate()+n);return r}
+
+// 3축 등급 라벨/색상
+const ratingMeta={
+  strong:{label:"강",color:"#22c55e"},
+  moderate:{label:"보통",color:"#f59e0b"},
+  weak:{label:"약",color:"#6b7280"}
+};
+const lifecycleMeta={
+  short:{label:"단기 1~3일",color:"#ef4444"},
+  mid:{label:"중기 1~4주",color:"#f59e0b"},
+  long:{label:"장기 1개월+",color:"#06b6d4"}
+};
+
+function RatingBadge({rating}){
+  const m=ratingMeta[rating]||ratingMeta.weak;
+  return <span style={{padding:"3px 10px",borderRadius:"12px",fontSize:"12px",fontWeight:700,color:m.color,background:`${m.color}18`,border:`1px solid ${m.color}30`}}>{m.label}</span>;
+}
+
+function LifecycleBadge({lifecycle}){
+  const m=lifecycleMeta[lifecycle];
+  if(!m)return null;
+  return <span style={{padding:"2px 8px",borderRadius:"10px",fontSize:"11px",fontWeight:600,color:m.color,background:`${m.color}12`,border:`1px solid ${m.color}25`,marginLeft:"6px"}}>{m.label}</span>;
+}
+
+function AxisSection({icon,title,rating,analysis,lifecycle}){
+  const m=ratingMeta[rating]||ratingMeta.weak;
+  if(!analysis)return null;
+  return <div style={{borderLeft:`3px solid ${m.color}`,paddingLeft:"16px",marginBottom:"16px"}}>
+    <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"8px",flexWrap:"wrap"}}>
+      <span style={{fontSize:"15px"}}>{icon}</span>
+      <span style={{fontWeight:700,fontSize:"15px"}}>{title}</span>
+      <RatingBadge rating={rating}/>
+      {lifecycle&&<LifecycleBadge lifecycle={lifecycle}/>}
+    </div>
+    <div style={{fontSize:"14px",lineHeight:1.85,color:"var(--text-sub)",whiteSpace:"pre-wrap"}}>{analysis}</div>
+  </div>;
+}
+
+function StockCard({stock,rank}){
+  const pctNum=parseFloat((stock.change_pct||"0").replace(/[+%]/g,""));
+  const isUp=pctNum>=0;
+  const pctColor=isUp?"#22c55e":"#ef4444";
+
+  // 새 구조(3축 분리) vs 기존 구조(단일 analysis) 하위 호환
+  const hasNewFormat=!!stock.catalyst_analysis;
+
+  return <Box style={{marginBottom:"16px",padding:"24px 28px"}}>
+    {/* 헤더: 순위 + 종목명 + 가격 */}
+    <div style={{display:"flex",alignItems:"center",gap:"14px",marginBottom:"18px",flexWrap:"wrap"}}>
+      <span style={{width:36,height:36,borderRadius:"10px",background:rank<=3?"rgba(245,158,11,0.14)":"var(--badge-bg2)",color:rank<=3?"#f59e0b":"var(--muted)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:"16px"}}>{rank}</span>
+      <div style={{flex:1,minWidth:0}}>
+        <span style={{fontWeight:700,fontSize:"18px"}}>{stock.name}</span>
+        <span style={{color:"var(--dim)",fontSize:"13px",marginLeft:"8px"}}>{stock.code}</span>
+      </div>
+      <div style={{textAlign:"right"}}>
+        <div style={{fontWeight:700,fontSize:"18px",fontVariantNumeric:"tabular-nums"}}>{String(stock.price).replace(/[₩\\s]/g,"").replace(/^/,"₩")}</div>
+        <div style={{fontWeight:700,fontSize:"15px",color:pctColor,marginTop:"2px"}}>{isUp?"▲":"▼"} {stock.change_pct}</div>
+      </div>
+    </div>
+
+    {/* 투자자 수급 데이터 */}
+    {(stock.foreign_net!=null||stock.institution_net!=null)&&(stock.foreign_net!==0||stock.institution_net!==0)&&<div style={{display:"flex",gap:"10px",marginBottom:"20px",flexWrap:"wrap"}}>
+      {[{label:"🌍 외국인",val:stock.foreign_net||0,sub:stock.foreign_ratio?`보유 ${stock.foreign_ratio}%`:""},{label:"🏛️ 기관",val:stock.institution_net||0},{label:"👤 개인",val:stock.individual_net||0}].map((inv,i)=><div key={i} style={{flex:1,minWidth:90,padding:"10px 14px",background:"var(--hover)",borderRadius:"8px",border:"1px solid var(--div2)",textAlign:"center"}}>
+        <div style={{fontSize:"12px",color:"var(--muted)",marginBottom:"4px"}}>{inv.label}</div>
+        <div style={{fontSize:"15px",fontWeight:700,color:inv.val>0?"#22c55e":inv.val<0?"#ef4444":"var(--dim)"}}>{inv.val>0?"+":""}{inv.val.toLocaleString()}억</div>
+        {inv.sub&&<div style={{fontSize:"11px",color:"var(--muted)",marginTop:"2px"}}>{inv.sub}</div>}
+      </div>)}
+    </div>}
+
+    {/* 3축 분석 - 새 구조 (축별 분리) */}
+    {hasNewFormat&&<div style={{marginBottom:"16px"}}>
+      <AxisSection icon="🔥" title="재료 분석" rating={stock.catalyst_rating} analysis={stock.catalyst_analysis} lifecycle={stock.catalyst_lifecycle}/>
+      <AxisSection icon="💰" title="수급 분석" rating={stock.supply_rating} analysis={stock.supply_analysis}/>
+      <AxisSection icon="🎯" title="모멘텀 분석" rating={stock.momentum_rating} analysis={stock.momentum_analysis}/>
+    </div>}
+
+    {/* 기존 구조 fallback (단일 analysis) */}
+    {!hasNewFormat&&stock.analysis&&<>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"10px",marginBottom:"18px"}}>
+        {[{icon:"🔥",title:"재료",rating:stock.catalyst_rating},{icon:"💰",title:"수급",rating:stock.supply_rating},{icon:"🎯",title:"모멘텀",rating:stock.momentum_rating}].map((ax,i)=><div key={i} style={{padding:"12px 14px",borderRadius:"10px",background:"var(--hover)",border:"1px solid var(--div2)",textAlign:"center"}}>
+          <div style={{fontSize:"13px",color:"var(--muted)",marginBottom:"6px"}}>{ax.icon} {ax.title}</div>
+          <RatingBadge rating={ax.rating}/>
+        </div>)}
+      </div>
+      <div style={{fontSize:"14px",lineHeight:1.8,color:"var(--text-sub)",marginBottom:"16px",whiteSpace:"pre-wrap"}}>{stock.analysis}</div>
+    </>}
+
+    {/* 핵심 판단 + 리스크 + 네이버 링크 */}
+    <div style={{padding:"14px 18px",borderRadius:"10px",background:"var(--hover)",border:"1px solid var(--div2)"}}>
+      {stock.verdict&&<div style={{display:"flex",alignItems:"flex-start",gap:"8px",marginBottom:stock.risk_note?"10px":"0"}}>
+        <span style={{flexShrink:0,fontSize:"14px",marginTop:"1px"}}>💡</span>
+        <span style={{fontWeight:600,fontSize:"15px",color:"var(--text)",lineHeight:1.6}}>{stock.verdict}</span>
+      </div>}
+      {stock.risk_note&&<div style={{display:"flex",alignItems:"flex-start",gap:"8px"}}>
+        <span style={{flexShrink:0,fontSize:"13px",marginTop:"1px"}}>⚠️</span>
+        <span style={{fontSize:"13px",color:"#ef4444",lineHeight:1.5,fontWeight:500}}>{stock.risk_note}</span>
+      </div>}
+    </div>
+
+    <div style={{display:"flex",justifyContent:"flex-end",marginTop:"14px"}}>
+      <a href={`https://stock.naver.com/domestic/stock/${stock.code}/total`} target="_blank" rel="noopener noreferrer" style={{display:"inline-flex",alignItems:"center",gap:"6px",padding:"8px 16px",borderRadius:"8px",background:"rgba(6,182,212,0.08)",border:"1px solid rgba(6,182,212,0.2)",color:"#06b6d4",fontSize:"14px",fontWeight:600,textDecoration:"none",transition:"all .2s",flexShrink:0}} onMouseEnter={e=>{e.currentTarget.style.background="rgba(6,182,212,0.15)"}} onMouseLeave={e=>{e.currentTarget.style.background="rgba(6,182,212,0.08)"}}>네이버 증권 →</a>
+    </div>
+  </Box>;
+}
+
+function App(){
+  const[theme,setTheme]=useState(getStoredTheme());
+  const[date,setDate]=useState(new Date());
+  const[data,setData]=useState(null);
+  const[loading,setLoading]=useState(true);
+  const[error,setError]=useState(null);
+
+  useEffect(()=>{applyTheme(theme)},[theme]);
+  const toggleTheme=()=>{const n=theme==="dark"?"light":"dark";setTheme(n);setStoredTheme(n)};
+
+  const dateStr=formatDate(date);
+  const today=formatDate(new Date());
+  const minDate=formatDate(addDays(new Date(),-90));
+
+  const loadData=useCallback(async()=>{
+    setLoading(true);setError(null);setData(null);
+    try{
+      const rows=await db("stock_analysis",`date=eq.${dateStr}&order=created_at.desc&limit=1`);
+      if(rows&&rows.length>0){
+        const row=rows[0];
+        let stocks=row.stocks;
+        if(typeof stocks==="string"){try{stocks=JSON.parse(stocks)}catch(e){stocks=[]}}
+        // issue_stocks에서 투자자 수급 데이터 merge
+        const issueRows=await db("issue_stocks",`date=eq.${dateStr}&select=*`);
+        if(issueRows&&issueRows.length>0){
+          const investorMap={};
+          issueRows.forEach(r=>{investorMap[r.code]=r});
+          (stocks||[]).forEach(s=>{
+            const inv=investorMap[s.code];
+            if(inv){s.foreign_net=inv.foreign_net;s.institution_net=inv.institution_net;s.individual_net=inv.individual_net;s.foreign_ratio=inv.foreign_ratio}
+          });
+        }
+        setData({market_context:row.market_context,stocks:stocks||[],date:row.date});
+      }else{
+        setData(null);
+      }
+    }catch(e){
+      setError("데이터 로드 실패");
+    }
+    setLoading(false);
+  },[dateStr]);
+
+  useEffect(()=>{loadData()},[loadData]);
+
+  const goPrev=()=>{const nd=addDays(date,-1);if(formatDate(nd)>=minDate)setDate(nd)};
+  const goNext=()=>{const nd=addDays(date,1);if(formatDate(nd)<=today)setDate(nd)};
+  const isAtToday=dateStr===today;
+  const isAtMin=dateStr<=minDate;
+
+  return <div style={{minHeight:"100vh",background:"var(--bg)"}}>
+    {/* 헤더 */}
+    <header style={{background:"var(--card-bg)",borderBottom:"1px solid var(--div)",padding:"14px 0",position:"sticky",top:0,zIndex:100,backdropFilter:"blur(12px)"}}>
+      <div style={{maxWidth:800,margin:"0 auto",padding:"0 20px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <a href="index.html" style={{display:"flex",alignItems:"center",gap:"10px",textDecoration:"none",color:"inherit"}}>
+          <span style={{fontSize:"18px",fontWeight:800,letterSpacing:"-0.5px"}}>
+            <span style={{color:"#06b6d4"}}>● </span>STOCKPULSE
+          </span>
+        </a>
+        <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
+          <a href="index.html" style={{fontSize:"14px",color:"var(--muted)",textDecoration:"none",fontWeight:500}}>Home</a>
+          <button onClick={toggleTheme} style={{background:"none",border:"none",cursor:"pointer",fontSize:"20px",padding:"4px"}}>{theme==="dark"?"☀️":"🌙"}</button>
+        </div>
+      </div>
+    </header>
+
+    {/* 메인 */}
+    <main style={{maxWidth:800,margin:"0 auto",padding:"32px 20px 60px"}}>
+      {/* 타이틀 */}
+      <h1 style={{fontSize:"24px",fontWeight:800,marginBottom:"8px",display:"flex",alignItems:"center",gap:"10px"}}>
+        <span style={{fontSize:"28px"}}>📊</span> 일간 종목 리포트
+      </h1>
+      <p style={{color:"var(--muted)",fontSize:"14px",marginBottom:"28px",lineHeight:1.6}}>
+        매일 장 마감 후 이슈 종목 TOP 5를 AI가 재료·수급·모멘텀 3축으로 심층 분석합니다.
+      </p>
+
+      {/* 날짜 네비게이터 */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"16px",marginBottom:"28px"}}>
+        <button onClick={goPrev} disabled={isAtMin} style={{background:"none",border:"1px solid var(--div2)",borderRadius:"8px",padding:"8px 14px",cursor:isAtMin?"not-allowed":"pointer",color:isAtMin?"var(--dim)":"var(--text)",fontSize:"16px",fontWeight:600,opacity:isAtMin?0.4:1,transition:"all .2s"}}>←</button>
+        <div style={{fontSize:"18px",fontWeight:700,minWidth:140,textAlign:"center",fontVariantNumeric:"tabular-nums"}}>{dateStr}</div>
+        <button onClick={goNext} disabled={isAtToday} style={{background:"none",border:"1px solid var(--div2)",borderRadius:"8px",padding:"8px 14px",cursor:isAtToday?"not-allowed":"pointer",color:isAtToday?"var(--dim)":"var(--text)",fontSize:"16px",fontWeight:600,opacity:isAtToday?0.4:1,transition:"all .2s"}}>→</button>
+      </div>
+
+      {/* 콘텐츠 */}
+      {loading&&<Loader/>}
+
+      {!loading&&error&&<Box hover={false} style={{textAlign:"center",padding:"40px 20px"}}>
+        <div style={{fontSize:"32px",marginBottom:"12px"}}>⚠️</div>
+        <div style={{fontSize:"16px",color:"var(--muted)"}}>{error}</div>
+      </Box>}
+
+      {!loading&&!error&&!data&&<Box hover={false} style={{textAlign:"center",padding:"40px 20px"}}>
+        <div style={{fontSize:"40px",marginBottom:"12px"}}>📭</div>
+        <div style={{fontSize:"16px",fontWeight:600,marginBottom:"8px"}}>이 날짜의 리포트가 없습니다</div>
+        <div style={{fontSize:"14px",color:"var(--muted)",lineHeight:1.6}}>종목 리포트는 장 마감 후(15:35) 생성됩니다.<br/>주말·공휴일에는 리포트가 생성되지 않습니다.</div>
+      </Box>}
+
+      {!loading&&!error&&data&&<>
+        {/* 시장 맥락 */}
+        {data.market_context&&<Box hover={false} style={{marginBottom:"20px",padding:"16px 22px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+            <span style={{fontSize:"16px"}}>🌐</span>
+            <span style={{fontWeight:600,fontSize:"14px",color:"var(--muted)"}}>시장 맥락</span>
+          </div>
+          <div style={{fontSize:"15px",lineHeight:1.7,marginTop:"10px",color:"var(--text-sub)"}}>{data.market_context}</div>
+        </Box>}
+
+        {/* 종목 카드 */}
+        {data.stocks.map((s,i)=><StockCard key={s.code||i} stock={s} rank={i+1}/>)}
+
+        {/* 면책 */}
+        <div style={{textAlign:"center",padding:"20px 0",color:"var(--dim)",fontSize:"12px",lineHeight:1.6}}>
+          본 리포트는 AI가 자동 생성한 분석으로, 투자 조언이 아닙니다.<br/>
+          투자 판단은 본인의 책임하에 이루어져야 합니다.
+        </div>
+      </>}
+    </main>
+
+    {/* 푸터 */}
+    <footer style={{borderTop:"1px solid var(--div)",padding:"24px 0",textAlign:"center"}}>
+      <div style={{maxWidth:800,margin:"0 auto",padding:"0 20px"}}>
+        <div style={{display:"flex",justifyContent:"center",gap:"20px",marginBottom:"12px",flexWrap:"wrap"}}>
+          <a href="index.html" style={{fontSize:"13px",color:"var(--muted)",textDecoration:"none"}}>홈</a>
+          <a href="guide.html" style={{fontSize:"13px",color:"var(--muted)",textDecoration:"none"}}>투자 가이드</a>
+          <a href="about.html" style={{fontSize:"13px",color:"var(--muted)",textDecoration:"none"}}>소개</a>
+        </div>
+        <div style={{fontSize:"12px",color:"var(--dim)"}}>© 2026 STOCKPULSE. AI 기반 실시간 시장 분석 플랫폼.</div>
+      </div>
+    </footer>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
