@@ -37,6 +37,16 @@
     .ban-item{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--div);transition:background .2s}
     .ban-item:last-child{border-bottom:none}
     .ban-item:hover{background:var(--hover)}
+    .col-lbl{display:block;font-size:13px;font-weight:600;margin:12px 0 6px;color:var(--text)}
+    .col-lbl span{font-weight:400;color:var(--muted);margin-left:6px}
+    .col-seg{padding:5px 12px;border-radius:7px;border:1px solid var(--card-bd);background:var(--card-bg);color:var(--text-sub);font-size:12px;cursor:pointer;font-family:inherit}
+    .col-seg.big{padding:8px 16px;font-size:14px}
+    .col-seg.on{border-color:#06b6d4;color:#06b6d4;font-weight:600}
+    .col-hints{font-size:12.5px;color:var(--muted);line-height:1.7;margin-bottom:6px;padding:8px 12px;border-radius:8px;background:var(--hover)}
+    .col-prev h2{font-size:17px;margin:18px 0 8px}.col-prev h3{font-size:15px;margin:14px 0 6px}
+    .col-prev p,.col-prev li{font-size:14px;line-height:1.8}.col-prev p{margin:0 0 10px}
+    .col-prev ul,.col-prev ol{padding-left:20px;margin:0 0 10px}
+    .col-prev blockquote{margin:0 0 10px;padding:6px 12px;border-left:3px solid var(--div2);color:var(--muted)}
     @media(max-width:700px){
       .admin-table th:nth-child(1){display:none}
       .admin-table td:nth-child(1){display:none}
@@ -350,12 +360,160 @@ function BannedNicknames({adminHash}){
   </div>;
 }
 
+// ═══ 칼럼 (반자동 글쓰기) ═══
+const COL_ERR={unauthorized:"권한이 없습니다 (최고관리자만)",title_required:"제목을 5자 이상 써 주세요",body_too_short:"본문이 너무 짧습니다 (300자 이상)",opinion_required:"AI 초안은 운영자 의견을 100자 이상 써야 발행할 수 있습니다",not_found:"글을 찾을 수 없습니다"};
+const COL_ST={draft:{t:"초안",c:"#f59e0b"},approved:{t:"발행 대기",c:"#06b6d4"},published:{t:"공개됨",c:"#22c55e"},discarded:{t:"버림",c:"#94a3b8"}};
+async function colRpc(fn,body){
+  const r=await fetch(SB_URL+"/rest/v1/rpc/"+fn,{method:"POST",headers:{apikey:SB_KEY,Authorization:"Bearer "+SB_KEY,"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const t=await r.text();
+  if(!r.ok){const k=Object.keys(COL_ERR).find(k=>t.includes(k));throw new Error(k?COL_ERR[k]:(r.status===404?"setup_column.sql 을 먼저 실행하세요":"오류 "+r.status))}
+  return t?JSON.parse(t):null;
+}
+function colInline(s,key){
+  return s.split(/(\*\*[^*]+\*\*)/).map((x,i)=>/^\*\*[^*]+\*\*$/.test(x)?<strong key={key+"b"+i}>{x.slice(2,-2)}</strong>:x);
+}
+function ColMd({text}){
+  const out=[];let para=[],lst=null,k=0;
+  const flush=()=>{
+    if(para.length){const p=para;out.push(<p key={k++}>{p.map((x,i)=><React.Fragment key={i}>{i>0&&<br/>}{colInline(x,"p"+k+i)}</React.Fragment>)}</p>);para=[]}
+    if(lst){const L=lst;const items=L.items.map((x,i)=><li key={i}>{colInline(x,"l"+i)}</li>);out.push(L.tag==="ul"?<ul key={k++}>{items}</ul>:<ol key={k++}>{items}</ol>);lst=null}
+  };
+  for(const raw of (text||"").replace(/\r\n/g,"\n").split("\n")){
+    const s=raw.trim();let m;
+    if(!s){flush();continue}
+    if((m=s.match(/^(#{1,4})\s+(.*)$/))){flush();out.push(m[1].length<=2?<h2 key={k++}>{colInline(m[2],"h"+k)}</h2>:<h3 key={k++}>{colInline(m[2],"h"+k)}</h3>);continue}
+    const ul=s.match(/^[-*•]\s+(.*)$/),ol=s.match(/^\d+[.)]\s+(.*)$/);
+    if(ul||ol){const tag=ul?"ul":"ol";if(para.length){const l=lst;lst=null;flush();lst=l}if(!lst||lst.tag!==tag){flush();lst={tag,items:[]}}lst.items.push((ul||ol)[1]);continue}
+    if(s.startsWith(">")){flush();out.push(<blockquote key={k++}>{colInline(s.replace(/^>\s*/,""),"q"+k)}</blockquote>);continue}
+    if(lst)flush();
+    para.push(s);
+  }
+  flush();
+  return <div className="col-prev">{out}</div>;
+}
+const colLen=s=>(s||"").replace(/[#*>\-\s]/g,"").length;
+
+function ColumnEditor({post,adminHash,onDone,onClose}){
+  const[f,setF]=useState({title:post.title||"",summary:post.summary||"",body:post.body||"",opinion:post.opinion||""});
+  const[preview,setPreview]=useState(false);
+  const[busy,setBusy]=useState("");
+  const[err,setErr]=useState("");
+  const[showData,setShowData]=useState(false);
+  const isAuto=post.kind==="auto";
+  const hints=(post.data&&post.data.opinion_hints)||[];
+  const facts=post.data&&post.data.facts;
+  const dirty=f.title!==(post.title||"")||f.summary!==(post.summary||"")||f.body!==(post.body||"")||f.opinion!==(post.opinion||"");
+  const set=k=>e=>setF(o=>({...o,[k]:e.target.value}));
+  const save=async(status)=>{
+    setBusy(status);setErr("");
+    try{
+      const r=await colRpc("column_save",{p_admin_hash:adminHash,p_id:post.id||null,p_title:f.title,p_summary:f.summary,p_body:f.body,p_opinion:f.opinion,p_status:status});
+      onDone(r&&r.id,status);
+    }catch(e){setErr(e.message)}
+    setBusy("");
+  };
+  const opLen=colLen(f.opinion);
+  const close=()=>{if(dirty&&!confirm("저장하지 않은 내용이 있습니다. 닫을까요?"))return;onClose()};
+  return <Box hover={false} style={{padding:"20px 22px"}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:14}}>
+      <button className="admin-btn admin-btn-secondary" onClick={close} style={{padding:"6px 12px",fontSize:13}}>← 목록</button>
+      <span style={{fontSize:13,color:"var(--muted)"}}>{post.date||"새 글"} · {isAuto?"AI 초안":"직접 쓴 글"}{post.status&&<> · <span style={{color:COL_ST[post.status].c,fontWeight:600}}>{COL_ST[post.status].t}</span></>}</span>
+      {post.status==="published"&&post.slug&&<a href={"column/"+post.slug+".html"} target="_blank" rel="noopener" style={{fontSize:13,color:"#06b6d4",marginLeft:"auto"}}>공개 페이지 ↗</a>}
+    </div>
+    {post.data&&post.data.error&&<div style={{fontSize:13,color:"#ef4444",marginBottom:10}}>AI 초안 생성 실패: {post.data.error} — 아래 데이터를 보고 직접 써 주세요.</div>}
+    <label className="col-lbl">제목</label>
+    <input className="admin-input" value={f.title} onChange={set("title")} maxLength={120} placeholder="그날의 핵심이 드러나는 제목"/>
+    <label className="col-lbl">요약 <span>검색 결과·목록에 보이는 두 문장</span></label>
+    <textarea className="admin-input" rows={2} value={f.summary} onChange={set("summary")} maxLength={300}/>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:14}}>
+      <label className="col-lbl" style={{margin:0}}>본문 <span>{colLen(f.body).toLocaleString()}자 · ## 소제목, - 목록, **굵게**</span></label>
+      <div style={{marginLeft:"auto",display:"flex",gap:4}}>
+        <button className={"col-seg"+(!preview?" on":"")} onClick={()=>setPreview(false)}>편집</button>
+        <button className={"col-seg"+(preview?" on":"")} onClick={()=>setPreview(true)}>미리보기</button>
+      </div>
+    </div>
+    {preview?<div className="admin-input" style={{minHeight:300,marginTop:6}}><ColMd text={f.body}/></div>
+      :<textarea className="admin-input" rows={18} value={f.body} onChange={set("body")} style={{marginTop:6,lineHeight:1.7,resize:"vertical"}}/>}
+    <label className="col-lbl" style={{marginTop:16}}>✍ 운영자 의견 <span style={{color:isAuto&&opLen<100?"#f59e0b":"var(--muted)"}}>{opLen}자{isAuto?" / 발행하려면 100자 이상":" (선택)"}</span></label>
+    {hints.length>0&&<div className="col-hints">{hints.map((h,i)=><div key={i}>· {h}</div>)}</div>}
+    <textarea className="admin-input" rows={6} value={f.opinion} onChange={set("opinion")} placeholder="AI가 쓸 수 없는 내 판단·경험을 써 주세요. 예: 오늘 이 종목을 직접 산다면 무엇을 더 확인하겠는가, 지난번 비슷한 상황에서 어땠는가" style={{lineHeight:1.7,resize:"vertical"}}/>
+    {facts&&<div style={{marginTop:12}}>
+      <button className="col-seg" onClick={()=>setShowData(v=>!v)}>{showData?"▾":"▸"} 초안에 쓴 데이터 보기</button>
+      {showData&&<pre style={{fontSize:12,maxHeight:320,overflow:"auto",background:"var(--hover)",padding:12,borderRadius:8,marginTop:6,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{JSON.stringify(facts,null,1)}</pre>}
+    </div>}
+    {err&&<div style={{color:"#ef4444",fontSize:13,marginTop:12}}>{err}</div>}
+    <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:18,alignItems:"center"}}>
+      <button className="admin-btn admin-btn-primary" disabled={!!busy} onClick={()=>save("approved")}>{busy==="approved"?"요청 중...":post.status==="published"?"수정 내용 다시 발행":"발행"}</button>
+      <button className="admin-btn admin-btn-secondary" disabled={!!busy} onClick={()=>save("draft")}>{busy==="draft"?"저장 중...":post.status==="published"||post.status==="approved"?"발행 취소 (초안으로)":"임시 저장"}</button>
+      {post.id&&post.status!=="published"&&<button className="admin-btn admin-btn-danger" disabled={!!busy} onClick={()=>{if(confirm("이 글을 버릴까요? (30일 뒤 목록에서 사라짐)"))save("discarded")}}>버리기</button>}
+    </div>
+    <div style={{fontSize:12,color:"var(--dimmer)",marginTop:10,lineHeight:1.6}}>발행하면 다음 크롤링(보통 5~10분 안) 때 <b>column/{post.slug||"…"}.html</b> 페이지가 만들어져 사이트에 올라갑니다. 발행 취소하면 다음 크롤링 때 페이지가 지워집니다.</div>
+  </Box>;
+}
+
+function ColumnManager({adminHash}){
+  const[list,setList]=useState(null);
+  const[err,setErr]=useState("");
+  const[open,setOpen]=useState(null);
+  const[showOld,setShowOld]=useState(false);
+  const load=useCallback(async(reopen)=>{
+    try{const d=await colRpc("column_list",{p_admin_hash:adminHash});setList(d||[]);setErr("");
+      if(reopen){const p=(d||[]).find(x=>x.id===reopen);if(p)setOpen(p)}
+    }catch(e){setErr(e.message);setList([])}
+  },[adminHash]);
+  useEffect(()=>{load()},[load]);
+  if(list===null)return <Loader/>;
+  if(open)return <ColumnEditor key={open.id||"new"} post={open} adminHash={adminHash} onClose={()=>{setOpen(null);load()}} onDone={(id,st)=>{if(st==="draft"&&open.id){load(id)}else if(st==="draft"){load(id)}else{setOpen(null);load()}}}/>;
+  const groups=[["draft","✏️ 검토할 초안"],["approved","⏳ 발행 대기 (다음 크롤링 때 공개)"],["published","✅ 공개된 글"]];
+  const pubN=list.filter(p=>p.status==="published"||p.status==="approved").length;
+  return <div>
+    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:14}}>
+      <div>
+        <div style={{fontWeight:700,fontSize:18}}>칼럼</div>
+        <div style={{fontSize:13,color:"var(--muted)",marginTop:2}}>공개 {pubN}개 · 평일 장 마감 후(17:30~) AI 초안이 하루 1개 만들어집니다</div>
+      </div>
+      <button className="admin-btn admin-btn-primary" onClick={()=>setOpen({kind:"manual",data:null})} style={{marginLeft:"auto",padding:"8px 16px",fontSize:13}}>＋ 직접 쓰기</button>
+    </div>
+    <Box hover={false} style={{padding:"12px 16px",marginBottom:16,fontSize:13,color:"var(--text-sub)",lineHeight:1.7}}>
+      AI 초안을 그대로 올리면 애드센스에서 '자동 생성 콘텐츠'로 볼 수 있습니다. <b>제목·요약을 내 말로 다듬고, 틀린 문장은 지우고, 운영자 의견(100자 이상)을 꼭 쓰세요.</b> 매일 다 올릴 필요는 없습니다 — 일주일에 2~3개, 쓸 거리가 있는 날만 고르는 편이 낫습니다.
+    </Box>
+    {err&&<div style={{color:"#ef4444",fontSize:13,marginBottom:12}}>{err}</div>}
+    {groups.map(([st,label])=>{
+      const items=list.filter(p=>p.status===st);
+      if(!items.length&&st!=="draft")return null;
+      return <div key={st} style={{marginBottom:18}}>
+        <div style={{fontWeight:600,fontSize:14,marginBottom:8}}>{label} <span style={{color:"var(--muted)",fontWeight:400}}>({items.length})</span></div>
+        <Box hover={false} style={{padding:0,overflow:"hidden"}}>
+          {items.length===0?<div style={{padding:"18px",fontSize:13,color:"var(--muted)"}}>검토할 초안이 없습니다</div>
+          :items.map(p=><div key={p.id} className="ban-item" style={{cursor:"pointer"}} onClick={()=>setOpen(p)}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:600,fontSize:14,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title||"(제목 없음)"}</div>
+              <div style={{fontSize:12,color:"var(--dimmer)",marginTop:2}}>{p.date} · {p.kind==="auto"?"AI 초안":"직접 쓴 글"} · 본문 {colLen(p.body).toLocaleString()}자 · 의견 {colLen(p.opinion)}자{p.data&&p.data.error?" · ⚠ 생성 실패":""}</div>
+            </div>
+            <span style={{fontSize:12,fontWeight:600,color:COL_ST[p.status].c,flexShrink:0}}>{COL_ST[p.status].t}</span>
+          </div>)}
+        </Box>
+      </div>;
+    })}
+    {list.some(p=>p.status==="discarded")&&<div>
+      <button className="col-seg" onClick={()=>setShowOld(v=>!v)}>{showOld?"▾":"▸"} 버린 글 ({list.filter(p=>p.status==="discarded").length})</button>
+      {showOld&&<Box hover={false} style={{padding:0,overflow:"hidden",marginTop:8}}>
+        {list.filter(p=>p.status==="discarded").map(p=><div key={p.id} className="ban-item" style={{cursor:"pointer"}} onClick={()=>setOpen(p)}>
+          <div style={{flex:1,fontSize:13}}>{p.date} · {p.title||"(제목 없음)"}</div>
+        </div>)}
+      </Box>}
+    </div>}
+  </div>;
+}
+
 // ═══ 관리자 대시보드 ═══
 function AdminDashboard({adminHash,adminInfo,onLogout,onHashChanged}){
   const[admins,setAdmins]=useState([]);
   const[loading,setLoading]=useState(true);
   const[deleteTarget,setDeleteTarget]=useState(null);
   const[showPwModal,setShowPwModal]=useState(false);
+  const[view,setView]=useState(()=>{try{return sessionStorage.getItem("sp-admin-view")||"column"}catch(e){return "column"}});
+  const setViewS=v=>{setView(v);try{sessionStorage.setItem("sp-admin-view",v)}catch(e){}};
 
   const loadAdmins=useCallback(async()=>{
     try{
@@ -401,6 +559,11 @@ function AdminDashboard({adminHash,adminInfo,onLogout,onHashChanged}){
   }
 
   return <div>
+    <div style={{display:"flex",gap:6,marginBottom:22}}>
+      <button className={"col-seg big"+(view==="column"?" on":"")} onClick={()=>setViewS("column")}>✍ 칼럼</button>
+      <button className={"col-seg big"+(view==="admins"?" on":"")} onClick={()=>setViewS("admins")}>👥 관리자·닉네임</button>
+    </div>
+    {view==="column"?<ColumnManager adminHash={adminHash}/>:<>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"20px",flexWrap:"wrap",gap:"8px"}}>
       <div>
         <div style={{fontWeight:700,fontSize:"18px"}}>관리자 목록</div>
@@ -429,6 +592,7 @@ function AdminDashboard({adminHash,adminInfo,onLogout,onHashChanged}){
     <AddAdminForm adminHash={adminHash} onAdded={loadAdmins}/>
 
     <BannedNicknames adminHash={adminHash}/>
+    </>}
 
     {deleteTarget&&<ConfirmModal nickname={deleteTarget.nickname} onConfirm={handleDelete} onCancel={()=>setDeleteTarget(null)}/>}
     {showPwModal&&<ChangePwModal adminHash={adminHash} onChanged={(h)=>{setShowPwModal(false);onHashChanged(h)}} onCancel={()=>setShowPwModal(false)}/>}

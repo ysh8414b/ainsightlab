@@ -85,6 +85,27 @@ jobs:
           done
           echo "today.html 푸시 실패 (다음 실행 때 다시 시도)"
 
+      # 칼럼: 평일 17:30 이후 AI 초안 1개(비공개, column_posts) + 관리자가 발행한 글을 column/*.html 로 만들어 커밋
+      - name: 칼럼 초안 + 발행 페이지 갱신
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python make_column.py draft --auto || true
+          python make_column.py build || exit 0
+          git add -A column sitemap.xml
+          if git diff --cached --quiet; then echo "칼럼 페이지 변화 없음"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "칼럼 페이지 갱신 ($(TZ=Asia/Seoul date '+%F %H:%M'))"
+          for i in 1 2 3; do
+            if git pull -q --rebase origin main && git push -q origin HEAD:main; then echo "칼럼 푸시 완료"; exit 0; fi
+            git rebase --abort 2>/dev/null || true; sleep 5
+          done
+          echo "칼럼 푸시 실패 (다음 실행 때 다시 시도)"
+
       # GitHub 예약 실행(schedule)은 몇 시간씩 늦거나 빠지는 일이 많음 →
       # 장 마감 후(평일 16:35~23:59 KST) 크롤링이 돌 때, 오늘 급등 AI 결과가 없고
       # 실행 중인 것도 없으면 급등 AI 워크플로를 대신 실행

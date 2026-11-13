@@ -313,7 +313,7 @@ def build():
 <p>STOCKPULSE(ainsightlab.kr)는 코스피·코스닥 데이터를 자동으로 모아 정리하는 무료 주식 정보 대시보드입니다.
 시세는 네이버 금융, 공시는 금융감독원 DART, 해외 지수·환율은 Yahoo Finance에서 가져옵니다.
 급등 종목 해설은 AI가 주어진 숫자만으로 쓴 글이고, 딥러닝 예측은 과거 패턴에 따른 확률일 뿐입니다.</p>
-<p>함께 읽을거리: <a href="guide-themes.html">테마주 매매 5원칙</a> · <a href="guide-supply.html">외국인·기관·개인 수급 읽기</a> ·
+<p>함께 읽을거리: <a href="column/">STOCKPULSE 칼럼</a> · <a href="guide-themes.html">테마주 매매 5원칙</a> · <a href="guide-supply.html">외국인·기관·개인 수급 읽기</a> ·
 <a href="guide-sectors.html">섹터 로테이션</a> · <a href="guide-indicators.html">PER·PBR·ROE 실전 활용</a></p>
 </section>
 <footer>이 페이지의 모든 정보는 일반 정보 제공 목적이며 특정 종목의 매수·매도 추천이 아닙니다.
