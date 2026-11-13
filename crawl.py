@@ -2835,6 +2835,7 @@ PULLBACK_WATCH_DAYS = 20                      # 급등일 이후 20거래일 안
 PULLBACK_TAKE_PROFIT = 10.0
 PULLBACK_STOP_LOSS = -10.0
 PULLBACK_KEEP_DAYS = 365
+CHAT_KEEP_DAYS = 30                 # 토론방(chat_messages) 보관 기간
 
 
 def save_daily_close(krx_data):
@@ -5372,6 +5373,13 @@ def main():
         cutoff_pb = (datetime.now() - timedelta(days=PULLBACK_KEEP_DAYS)).strftime("%Y-%m-%d")
         supabase_request("DELETE", "pullback_track", params={"signal_date": f"lt.{cutoff_pb}"})
         log(f"  🧹 {cutoff_dp} 이전 일봉 / {cutoff_os} 이전 과대 낙폭 / {cutoff_ct} 이전 재료 포착 / {cutoff_ot} 이전 낙폭 성과 정리")
+        # 토론방 채팅 30일 초과 삭제 (created_at = timestamptz, UTC 'Z' 표기로 비교)
+        cutoff_chat = (datetime.utcnow() - timedelta(days=CHAT_KEEP_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            supabase_request("DELETE", "chat_messages", params={"created_at": f"lt.{cutoff_chat}"})
+            log(f"  🧹 {CHAT_KEEP_DAYS}일 지난 토론방 채팅 정리 ({cutoff_chat} 이전)")
+        except Exception as e:
+            log(f"  ⚠️ 토론방 채팅 정리 실패: {e}")
 
     log("")
     log("=" * 50)
