@@ -2127,7 +2127,8 @@ function App(){
   const getTabFromHash=()=>{let h=(window.location.hash||"").replace(/^#/,"");if(h==="ai")h="surge";
     // 구글 로그인에서 돌아오면 내 매매 탭으로
     try{if(localStorage.getItem("sp-login-return")&&/[?&]code=/.test(location.search)){localStorage.removeItem("sp-login-return");return "mytrade"}}catch(e){}
-    return VALID_TABS.includes(h)?h:"overview"};
+    // 주소에 탭이 없으면 첫 화면 = 내 매매 (시장 개요는 #overview)
+    return VALID_TABS.includes(h)?h:"mytrade"};
   const[tab,setTab]=useState(getTabFromHash);
   const[time,setTime]=useState(new Date());
   const[loading,setLoading]=useState(true);
@@ -2153,7 +2154,7 @@ function App(){
   },[theme]);
 
   useEffect(()=>{
-    const desired=tab==="overview"?"":"#"+tab;
+    const desired=tab==="mytrade"?"":"#"+tab;
     if(window.location.hash!==desired){history.replaceState(history.state,"",(desired?window.location.pathname+window.location.search+desired:window.location.pathname+window.location.search))}
   },[tab]);
 
