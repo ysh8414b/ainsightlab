@@ -313,7 +313,7 @@ function BannedNicknames({adminHash}){
         <button className="admin-btn admin-btn-primary" onClick={addBan} disabled={adding} style={{flexShrink:0}}>{adding?"추가 중...":"추가"}</button>
       </div>
       {err&&<div style={{color:"#ef4444",fontSize:"13px",marginTop:"8px"}}>{err}</div>}
-      <div style={{fontSize:"12px",color:"var(--dimmer)",marginTop:"8px"}}>제한된 닉네임은 게시판 글/댓글 작성 및 채팅 입장이 차단됩니다. (대소문자 구분 없음)</div>
+      <div style={{fontSize:"12px",color:"var(--dimmer)",marginTop:"8px"}}>제한된 닉네임은 채팅 입장과 내 매매 닉네임 사용이 차단됩니다. (대소문자 구분 없음)</div>
     </Box>
 
     {/* 목록 */}
@@ -496,7 +496,6 @@ function App(){
       <div><span style={{fontWeight:600,color:"var(--dim)"}}>STOCKPULSE</span> © 2026</div>
       <div className="footer-links">
         <a href="index.html">메인</a>
-        <a href="board.html">게시판</a>
       </div>
     </footer>
   </div>;
