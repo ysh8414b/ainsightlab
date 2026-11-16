@@ -65,3 +65,10 @@ DROP POLICY IF EXISTS "Allow anon read" ON pullback_track;
 CREATE POLICY "Allow anon read" ON pullback_track
     FOR SELECT USING (true);
 -- 쓰기는 크롤러의 service role 키로만.
+
+-- ── 2026-11-16: 매도 규칙 변경 — 급등일 이후 장중 고점~저점의 1/4 지점(종가 기준) 매도 / -10% 손절 / 5거래일 경과 매도 ──
+-- 이미 테이블을 만들었다면 이 부분만 다시 실행해도 됨
+ALTER TABLE pullback_track ADD COLUMN IF NOT EXISTS range_high NUMERIC;   -- 급등일~오늘 장중 최고가
+ALTER TABLE pullback_track ADD COLUMN IF NOT EXISTS range_low NUMERIC;    -- 급등일~오늘 장중 최저가
+ALTER TABLE pullback_track ADD COLUMN IF NOT EXISTS exit_target NUMERIC;  -- 매도 지점 = 저점 + (고점-저점)/4
+ALTER TABLE pullback_track ADD COLUMN IF NOT EXISTS close_reason TEXT;    -- bounce | stop | time

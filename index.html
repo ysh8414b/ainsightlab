@@ -468,14 +468,20 @@ const BET_KINDS={
     sql:"setup_leader_track.sql",empty:"장 마감 후(15:35) 주도 테마가 나온 날부터 쌓이기 시작합니다 — 조건을 만족하는 테마가 없는 날은 편입이 없습니다",
     note:r=>[`🔥 ${r.theme_name||"-"}`,`동반 ${r.theme_count||0}종목`,`당일 ${catPct(r.change_pct)}`,r.status!=="closed"&&r.last_ma?`10일선 ₩${Math.round(Number(r.last_ma)).toLocaleString()}`:`거래대금 ${Math.round((Number(r.trading_value)||0)/1e8).toLocaleString()}억`].join(" · "),
     colLabel:"종목 · 주도 테마",expandable:true},
-  pullback:{table:"pullback_track",rule:"종가 기준 +10% 익절 / -10% 손절",color:"#a855f7",
-    title:"급등주 급락 성과 추적",sub:"급등일 시가 이탈 시 매수 · +10% / -10% 청산",
+  pullback:{table:"pullback_track",rule:"급등일 이후 고점~저점의 1/4 지점 반등 시 매도 · 5거래일 경과 시 매도",color:"#a855f7",
+    title:"급등주 급락 성과 추적",sub:"급등일 시가 이탈 시 매수 · 고점~저점 1/4 반등 매도",
     intro:<><b style={{color:"#a855f7"}}>+10% 이상 · 거래대금 3,000억 이상</b> 터진 종목을 감시 목록에 올리고,
       <b> 그 뒤 20거래일 안에 종가가 급등일 시가보다 아래로 내려오면</b> 그날 종가에 샀다고 가정합니다.
-      이후 매 거래일 종가 기준으로 <b style={{color:"#22c55e"}}>+10% 이상이면 익절</b>, <b style={{color:"#ef4444"}}>-10% 이하면 손절</b>로 마감합니다.
+      이후 매 거래일 <b>급등일 당일부터 그날까지의 장중 고점과 저점</b>을 잇고, 종가가 <b style={{color:"#22c55e"}}>저점에서 1/4 지점(저점 + (고점−저점)÷4) 이상으로 반등하면 그 종가에 매도</b>합니다
+      (예: 고점 3,700 · 저점 2,300 → 2,650원). 저점이 더 내려가면 매도 지점도 함께 내려가고, 매수가보다 낮아도 규칙대로 팝니다.
+      손절선은 없고, <b>5거래일째까지 안 팔렸으면 그날 종가에 매도</b>합니다. 매도할 때 수익이면 익절, 손실이면 손절로 표시합니다.
       20거래일 동안 시가 아래로 내려오지 않으면 감시를 끝냅니다(만료). 표의 날짜는 <b>매수(진입)일</b>입니다.</>,
+    introNote:" 매도 판단은 종가로 하고, 고점·저점은 네이버 일봉 고가·저가(NXT 시간외 거래 포함)를 씁니다. 수수료·세금·슬리피지는 반영하지 않았습니다.",
     sql:"setup_pullback_track.sql",empty:"장 마감 후(15:35) 감시 종목이 급등일 시가 아래로 내려오면 쌓이기 시작합니다",
-    note:r=>[`급등 ${String(r.signal_date||"").slice(5)} ${catPct(r.signal_change)}`,`시가 ₩${Math.round(Number(r.signal_open)||0).toLocaleString()}`,`${r.watch_days||0}일째 진입`,`거래대금 ${Math.round((Number(r.trading_value)||0)/1e8).toLocaleString()}억`].join(" · "),
+    note:r=>[`급등 ${String(r.signal_date||"").slice(5)} ${catPct(r.signal_change)}`,`시가 ₩${Math.round(Number(r.signal_open)||0).toLocaleString()}`,
+      r.status!=="closed"&&r.exit_target?`매도 지점 ₩${Math.round(Number(r.exit_target)).toLocaleString()} (고점 ₩${Math.round(Number(r.range_high)).toLocaleString()} · 저점 ₩${Math.round(Number(r.range_low)).toLocaleString()})`:null,
+      r.status==="closed"&&r.close_reason?{bounce:"1/4 반등 매도",stop:"-10% 손절(예전 규칙)",time:"5거래일 경과 매도"}[r.close_reason]:null,
+      `${r.watch_days||0}일째 진입`].filter(Boolean).join(" · "),
     colLabel:"종목 · 급등일",watch:true},
   scalp:{table:"leader_scalp",color:"#eab308",title:"주도주 단타 성과 추적",sub:"선정 다음날·다다음날 장중 매매 · +2% 익절",custom:true},
 };
@@ -631,7 +637,7 @@ function BetTrack({kind}){
   const rows=K.watch?allRows.filter(r=>r.status==="open"||r.status==="closed"):allRows;
   const watchList=K.watch?<PullbackWatch rows={allRows.filter(r=>r.status==="watch").sort((a,b)=>String(b.signal_date).localeCompare(String(a.signal_date)))} expiredN={allRows.filter(r=>r.status==="expired").length} color={K.color}/>:null;
   const intro=<div style={{marginBottom:"16px",padding:"14px 16px",background:`${K.color}0d`,border:`1px solid ${K.color}26`,borderRadius:"10px",fontSize:"14px",lineHeight:1.65,color:"var(--text-sub)"}}>
-    {K.intro}<span style={{color:"var(--dim)"}}> 장중 고가·저가가 아니라 종가만 보며, 수수료·세금·슬리피지는 반영하지 않았습니다.</span>
+    {K.intro}<span style={{color:"var(--dim)"}}>{K.introNote||" 장중 고가·저가가 아니라 종가만 보며, 수수료·세금·슬리피지는 반영하지 않았습니다."}</span>
   </div>;
   if(!rows.length)return <div>{intro}{!err&&watchList}<Empty msg={err?`성과 데이터를 불러오지 못했습니다 — Supabase에 ${K.table} 테이블(${K.sql})을 만들었는지 확인하세요`:`아직 누적된 기록이 없습니다 — ${K.empty}`}/></div>;
 

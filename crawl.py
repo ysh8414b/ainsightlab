@@ -2887,8 +2887,8 @@ LEADER_SCALP_EXIT_HHMM = "1520" # 이 시각(동시호가 시작) 전 마지막 
 PULLBACK_MIN_CHANGE = 10.0                    # 신호: 당일 +10% 이상
 PULLBACK_MIN_TRADING_VALUE = 300_000_000_000  # 신호: 거래대금 3,000억 이상
 PULLBACK_WATCH_DAYS = 20                      # 급등일 이후 20거래일 안에 시가 아래로 오면 매수
-PULLBACK_TAKE_PROFIT = 10.0
-PULLBACK_STOP_LOSS = -10.0
+PULLBACK_BOUNCE_FRAC = 0.25                   # 매도 지점 = 급등일 이후 장중 저점 + (고점-저점) × 1/4 (종가가 닿으면 매도)
+PULLBACK_MAX_HOLD = 5                         # 5거래일 보유하면 그날 종가에 매도
 PULLBACK_KEEP_DAYS = 365
 CHAT_KEEP_DAYS = 30                 # 토론방(chat_messages) 보관 기간
 
@@ -4567,10 +4567,101 @@ def _fetch_naver_today_open(code):
     return 0
 
 
+def _fetch_naver_day_range(code, start_day, end_day):
+    """네이버 일봉(api.stock.naver.com)으로 기간 장중 (최고가, 최저가). 실패하면 None.
+    ※ 네이버 일봉 고가·저가는 NXT(08:00~20:00) 거래가 섞여 있음."""
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://api.stock.naver.com/chart/domestic/item/{code}/day",
+                             params={"startDateTime": start_day.replace("-", "") + "0000",
+                                     "endDateTime": end_day.replace("-", "") + "2359"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if r.status_code != 200:
+                time.sleep(1 + attempt)
+                continue
+            bars = [b for b in (r.json() or []) if float(b.get("highPrice") or 0) > 0 and float(b.get("lowPrice") or 0) > 0]
+            if not bars:
+                return None
+            return max(float(b["highPrice"]) for b in bars), min(float(b["lowPrice"]) for b in bars)
+        except Exception:
+            time.sleep(1 + attempt)
+    return None
+
+
 def update_pullback_track(krx_data):
-    """진행 중(open) 종목 갱신(+10% 익절 / -10% 손절). 오늘 마감된 종목 목록을 반환."""
-    return _update_bet_track("pullback_track", krx_data, "급등주 급락",
-                             take_profit=PULLBACK_TAKE_PROFIT, stop_loss=PULLBACK_STOP_LOSS)
+    """진행 중(open) 종목 갱신. 오늘 마감된 종목 목록을 반환.
+
+    매도 규칙 (종가 기준, 위에서부터):
+      1) 종가 >= 저점 + (고점-저점) × 1/4 → 매도 (고점·저점 = 급등일 당일부터 오늘까지 장중 최고·최저가,
+         매수가보다 낮아도 매도 — 수익률 > 0 이면 win, 아니면 loss)
+      2) 5거래일째 → 그날 종가에 매도 (손절선 없음)
+    """
+    if not krx_data:
+        return []
+    probe = supabase_request("GET", "pullback_track", params={"select": "exit_target", "limit": "1"})
+    has_cols = probe is not None   # SQL(범위 칸) 실행 전이면 범위 칸은 저장하지 않음
+    rows, offset = [], 0
+    while True:
+        batch = supabase_request("GET", "pullback_track", params={
+            "status": "eq.open", "last_date": f"neq.{TODAY}",
+            "select": "id,code,name,signal_date,entry_price,days_tracked,max_ret,min_ret",
+            "order": "id", "limit": "1000", "offset": str(offset)})
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    if not rows:
+        log("  ℹ️ 갱신할 급등주 급락 추적 종목 없음")
+        return []
+
+    now_iso = datetime.now(timezone(timedelta(hours=9))).isoformat()
+    closed_list, cnt = [], {"bounce": 0, "time": 0, "hold": 0, "skip": 0}
+    for row in rows:
+        d = krx_data.get(row["code"])
+        price = float(d.get("price", 0)) if d else 0
+        entry = float(row.get("entry_price") or 0)
+        if price <= 0 or entry <= 0:
+            cnt["skip"] += 1
+            continue
+        days = int(row.get("days_tracked") or 0) + 1
+        ret = round((price - entry) / entry * 100, 2)
+        payload = {"last_price": price, "last_date": TODAY, "days_tracked": days, "ret_cum": ret,
+                   "max_ret": max(float(row.get("max_ret") or 0), ret),
+                   "min_ret": min(float(row.get("min_ret") or 0), ret), "updated_at": now_iso}
+        rng = _fetch_naver_day_range(row["code"], row["signal_date"], TODAY)
+        target = None
+        if rng:
+            hi, lo = max(rng[0], price), min(rng[1], price)
+            target = lo + (hi - lo) * PULLBACK_BOUNCE_FRAC
+            if has_cols:
+                payload.update(range_high=hi, range_low=lo, exit_target=round(target, 2))
+        else:
+            log(f"  ⚠️ {row.get('name')} 일봉 고가·저가 조회 실패 — 오늘은 1/4 지점 매도 판단 안 함")
+
+        reason = None
+        if target is not None and price >= target:
+            reason = "bounce"
+        elif days >= PULLBACK_MAX_HOLD:
+            reason = "time"
+        if reason:
+            result = "win" if ret > 0 else "loss"
+            payload.update(status="closed", result=result, close_date=TODAY, close_price=price,
+                           close_ret=ret, hold_days=days)
+            if has_cols:
+                payload["close_reason"] = reason
+            label = {"bounce": "고점~저점 1/4 지점 반등", "time": f"{PULLBACK_MAX_HOLD}거래일 경과"}[reason]
+            closed_list.append({"kind": "급등주 급락", "name": row.get("name") or row["code"], "code": row["code"],
+                                "result": result, "ret": ret, "days": days, "reason": label})
+            cnt[reason] += 1
+        else:
+            cnt["hold"] += 1
+        supabase_request("PATCH", "pullback_track", data=payload, params={"id": f"eq.{row['id']}"})
+
+    log(f"  📈 급등주 급락 갱신 {len(rows) - cnt['skip']}종목 (1/4 반등 매도 {cnt['bounce']} · "
+        f"{PULLBACK_MAX_HOLD}일 경과 {cnt['time']} · 보유 {cnt['hold']} · 시세없음 {cnt['skip']})")
+    return closed_list
 
 
 def update_pullback_watch(krx_data):
@@ -4797,7 +4888,7 @@ def notify_track_kakao(leader_new, oversold_new, closed, pullback_new=None):
         if pullback_new:
             lines = [f"{r['name']} {r['signal_date'][5:]} 급등({float(r.get('signal_change') or 0):+.1f}%) 시가 "
                      f"{float(r['signal_open']):,.0f} 이탈 · {r['entry_price']:,.0f}원 매수 ({r['watch_days']}일째)" for r in pullback_new]
-            for m in _kakao_chunks(lines, f"📉 급등주 급락 매수 {md} · {len(pullback_new)}종목 (±10%)"):
+            for m in _kakao_chunks(lines, f"📉 급등주 급락 매수 {md} · {len(pullback_new)}종목 (1/4 반등 매도 · 5일)"):
                 sent += kakao_send(m, page)
         # 매도(마감)
         if closed:
