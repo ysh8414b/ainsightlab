@@ -2878,6 +2878,10 @@ LEADER_MIN_THEME_STOCKS = 3                 # 주도 테마: 위 조건 종목�
 LEADER_MAX_PICKS = 3                        # 하루 최대 편입 (강한 테마 순, 테마당 대장 1종목)
 LEADER_TRACK_EXIT_MA = 10                   # 종가가 10일 이동평균선 아래로 내려가면 매도 (익절·손절선 없음)
 LEADER_TRACK_KEEP_DAYS = 365
+# 주도주 단타 (leader_scalp): 선정 다음 거래일·그다음 거래일, 분봉으로 장중 매매 시뮬레이션
+LEADER_SCALP_DAYS = 2           # 추적 거래일 수
+LEADER_SCALP_TAKE = 2.0         # 평균단가 +2% 익절
+LEADER_SCALP_EXIT_HHMM = "1520" # 이 시각(동시호가 시작) 전 마지막 가격에 매도, 이후 매수 안 함
 
 # ── 급등주 급락 매수 성과 추적 (pullback_track) ──
 PULLBACK_MIN_CHANGE = 10.0                    # 신호: 당일 +10% 이상
@@ -4221,12 +4225,32 @@ def update_leader_track(krx_data):
     return _update_bet_track("leader_track", krx_data, "주도주", exit_ma=LEADER_TRACK_EXIT_MA)
 
 
+def _leader_trend_kept(code, day=None):
+    """선정일 추세 유지 확인: 당일 고가를 찍은 뒤 정규장 1분봉 종가가 당일 중심가((고가+저가)/2)
+    아래로 내려간 적이 있으면 False (예: 한진칼 11/10 — 12:41 고가 뒤 13:39 중심가 이탈, 종가 회복).
+    고가 전 상승 도중의 출렁임은 보지 않음. 분봉을 못 받으면 True (판단 보류, 선정 유지)."""
+    day = day or TODAY
+    bars = _fetch_naver_minute_bars(code, day, day).get(day)
+    if not bars:
+        return True, "분봉 없음 — 확인 못 함"
+    hi, lo = max(b[2] for b in bars), min(b[3] for b in bars)
+    mid = (hi + lo) / 2
+    i_hi = next(i for i, b in enumerate(bars) if b[2] == hi)
+    for t, _o, _h, _l, c in bars[i_hi:]:
+        if c < mid:
+            return False, (f"{bars[i_hi][0][:2]}:{bars[i_hi][0][2:]} 고가 ₩{hi:,.0f} 뒤 "
+                           f"{t[:2]}:{t[2:]} 중심가 ₩{mid:,.0f} 아래로 내려감 (저가 ₩{lo:,.0f})")
+    return True, ""
+
+
 def select_leader_stocks(krx_data, theme_map):
     """주도 테마의 대장주 선정.
 
     주도 테마 = 테마 안에 '당일 +10% 이상 · 거래대금 1,000억 이상' 종목이 대장 포함 3개 이상
               (개별 종목 혼자 오른 날은 제외 — 테마가 같이 올라야 함)
     대장     = 그 충족 종목 중 상승률(50) + 거래대금(50) 정규화 점수 1위
+              단, 당일 중심가((고가+저가)/2) 위로 올라선 뒤 다시 아래로 내려갔던 종목은 제외하고 다음 순위가 대장
+              (충족 종목이 모두 제외되면 그 테마는 편입 없음)
     테마 순서 = 충족 종목 수 ↓ → 구체적인 테마 우선(로봇 > 기계) → 충족 종목 평균 상승률 ↓ → 거래대금 합 ↓
     같은 종목이 여러 테마의 대장이면 가장 강한 테마 하나로 편입하고 나머지는 other_themes 로 기록.
     """
@@ -4265,9 +4289,30 @@ def select_leader_stocks(krx_data, theme_map):
 
     themes.sort(key=lambda t: (-len(t["hits"]), THEME_SPECIFICITY.get(t["name"], 3), -t["avg"], -t["tv_sum"]))
 
+    trend = {}   # code → True(추세 유지) / False(중심가 이탈)
+
+    def trend_ok(d):
+        if d["code"] not in trend:
+            ok, why = _leader_trend_kept(d["code"])
+            trend[d["code"]] = ok
+            if not ok:
+                log(f"  ⏭ 추세 이탈로 대장 제외: {d.get('name', '')} {d.get('change_pct', 0):+.1f}% — {why}")
+        return trend[d["code"]]
+
     picks, by_code = [], {}
     for t in themes:
-        code = t["leader"]["code"]
+        # 대장 = 점수 순으로 보되, 당일 중심가를 깨고 내려갔던 종목은 건너뜀 (다음 종목이 대장)
+        leader = None
+        for h in t["hits"]:
+            if len(picks) >= LEADER_MAX_PICKS and h["code"] not in trend:
+                break             # 자리가 다 찼으면 새로 조회하지 않음 (other_themes 기록용으로만 확인)
+            if trend_ok(h):
+                leader = h
+                break
+        if leader is None:
+            continue
+        t["leader"] = leader
+        code = leader["code"]
         if code in by_code:
             by_code[code]["other_themes"].append(t["name"])
             continue
@@ -4333,6 +4378,171 @@ def seed_leader_track(picks):
     result = supabase_request("POST", "leader_track", data=picks)
     log(f"  🔥 주도주 성과 추적 편입 {len(picks)}종목 {'✅' if result else '❌'}")
     return [r for r in picks if r["code"] not in existing] if result else []
+
+
+# ── 주도주 단타 (leader_scalp) ──
+def _fetch_naver_minute_bars(code, start_day, end_day):
+    """네이버 1분봉(시·고·저·종) → 정규장(09:00~15:30)만 {YYYY-MM-DD: [(HHMM, o, h, l, c)]}.
+
+    네이버 일봉 종가는 NXT 20:00 종가라 쓰지 않고, 정규장 분봉에서 시가·종가를 직접 구함.
+    분봉은 최근 약 7거래일만 제공됨.
+    """
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://api.stock.naver.com/chart/domestic/item/{code}/minute",
+                             params={"startDateTime": start_day.replace("-", "") + "0800",
+                                     "endDateTime": end_day.replace("-", "") + "1600"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            if r.status_code != 200:
+                time.sleep(1 + attempt)
+                continue
+            out = {}
+            for b in r.json() or []:
+                ts = str(b.get("localDateTime", ""))
+                hm = ts[8:12]
+                if len(ts) < 12 or not ("0900" <= hm <= "1530"):
+                    continue
+                o, h, l, c = (float(b.get(k) or 0) for k in ("openPrice", "highPrice", "lowPrice", "currentPrice"))
+                if min(o, h, l, c) <= 0:
+                    continue
+                out.setdefault(f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}", []).append((hm, o, h, l, c))
+            for v in out.values():
+                v.sort()
+            return out
+        except Exception:
+            time.sleep(1 + attempt)
+    return {}
+
+
+def _bars_to_ticks(bars):
+    """분봉 → 가격 순서 [(HHMM, 가격)]. 봉 안 순서는 양봉 = 시→저→고→종, 음봉 = 시→고→저→종으로 가정."""
+    ticks = []
+    for t, o, h, l, c in bars:
+        path = (o, l, h, c) if c >= o else (o, h, l, c)
+        ticks.extend((t, p) for p in path)
+    return ticks
+
+
+def simulate_leader_scalp(ref, day_open, ticks, take=LEADER_SCALP_TAKE, exit_hhmm=LEADER_SCALP_EXIT_HHMM):
+    """하루 장중 매매 시뮬레이션 (하루 1번만 매수).
+
+    ref = 기준가(선정일 종가), ticks = [(HHMM, 가격)] 시간순.
+    시가 > 기준가(up): 구간 = 기준가 ~ 그때까지 고가. 1/4 지점 1차 매수, 1/8 지점 추가 매수, 손절 = 기준가 아래.
+    시가 <= 기준가(down): 고가가 기준가 위로 올라간 뒤, 구간 = 그때까지 저점 ~ 고가. 1/4·1/8 지점 매수, 손절 = 저점 아래.
+    매수 가격(구간 기준)은 1차 매수 때 고정. 같은 금액 두 번 → 평균단가 = 조화평균. 익절 = 평균단가 +take%.
+    exit_hhmm 이후엔 매수하지 않고, 그 전 마지막 가격에 매도.
+    """
+    mode = "up" if day_open > ref else "down"
+    res = {"mode": mode, "status": "no_entry"}
+    pts = [("0900", day_open)] + [(t, p) for t, p in ticks if t < exit_hhmm]
+    if len(pts) == 1:
+        return res
+    hi = lo = day_open
+    buys = []          # [(가격, 시각)]
+    lvl1 = lvl2 = stop = take_px = None
+    last_t, last_p = pts[0]
+    for t, p in pts:
+        last_t, last_p = t, p
+        if not buys:
+            if p >= hi:                # 새 고가 → 매수 지점 위라 살 일 없음
+                hi = p
+                continue
+            # 매수 지점은 이 가격이 오기 전까지의 고가·저가로 계산 (분봉이 건너뛰어도 지정가에 먼저 닿은 것으로 봄)
+            base = ref if mode == "up" else lo
+            armed = mode == "up" or hi > ref   # down: 고가가 기준가 위로 올라간 뒤에만
+            l1 = base + (hi - base) / 4
+            if armed and hi > base and p <= l1:
+                lvl1, lvl2 = l1, base + (hi - base) / 8
+                stop = base
+                res.update(base_low=base, base_high=hi)
+                buys.append((lvl1, t))
+            else:
+                lo = min(lo, p)
+                continue
+        # 매수한 상태
+        if len(buys) == 1 and p <= lvl2:
+            buys.append((lvl2, t))
+        avg = len(buys) / sum(1 / b for b, _ in buys)
+        take_px = avg * (1 + take / 100)
+        if p < stop:
+            return _scalp_close(res, buys, avg, take_px, stop, p, t, "sl")
+        if p >= take_px:
+            return _scalp_close(res, buys, avg, take_px, stop, take_px, t, "tp")
+    if buys:
+        avg = len(buys) / sum(1 / b for b, _ in buys)
+        return _scalp_close(res, buys, avg, avg * (1 + take / 100), stop, last_p, last_t, "close")
+    return res
+
+
+def _scalp_close(res, buys, avg, take_px, stop, px, t, reason):
+    ret = (px - avg) / avg * 100
+    res.update(status="done", avg_price=round(avg, 2), take_price=round(take_px, 2), stop_price=stop,
+               buy1_price=round(buys[0][0], 2), buy1_time=_hhmm(buys[0][1]),
+               buy2_price=round(buys[1][0], 2) if len(buys) > 1 else None,
+               buy2_time=_hhmm(buys[1][1]) if len(buys) > 1 else None,
+               exit_price=round(px, 2), exit_time=_hhmm(t), exit_reason=reason,
+               ret=round(ret, 2), result="win" if ret > 0 else "loss")
+    return res
+
+
+def _hhmm(t):
+    return f"{t[:2]}:{t[2:]}"
+
+
+def update_leader_scalp():
+    """최근 주도주 선정분의 1·2일차 장중 매매를 분봉으로 계산해 leader_scalp 에 저장.
+
+    네이버 분봉은 최근 약 7거래일만 있어 그 안의 날짜만 계산 가능. 이미 저장한 (선정일, 종목, 일차)는 건너뜀.
+    새로 저장한 행 목록 반환.
+    """
+    since = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+    picks = supabase_request("GET", "leader_track", params={
+        "pick_date": f"gte.{since}", "select": "pick_date,code,name,theme_name,rank,entry_price",
+        "order": "pick_date.asc"}) or []
+    picks = [p for p in picks if p["pick_date"] < TODAY]
+    if not picks:
+        return []
+    have = {(r["pick_date"], r["code"], r["day_no"]) for r in (supabase_request("GET", "leader_scalp", params={
+        "pick_date": f"gte.{since}", "select": "pick_date,code,day_no"}) or [])}
+    now_hhmm = datetime.now(timezone(timedelta(hours=9))).strftime("%H%M")
+    rows = []
+    for pk in picks:
+        need = [n for n in range(1, LEADER_SCALP_DAYS + 1) if (pk["pick_date"], pk["code"], n) not in have]
+        if not need:
+            continue
+        end = (datetime.strptime(pk["pick_date"], "%Y-%m-%d") + timedelta(days=12)).strftime("%Y-%m-%d")
+        bars = _fetch_naver_minute_bars(pk["code"], pk["pick_date"], min(end, TODAY))
+        if pk["pick_date"] not in bars:
+            log(f"  ⚠️ 주도주 단타: {pk['name']} {pk['pick_date']} 분봉 없음 (7거래일 지남?) — 건너뜀")
+            continue
+        ref = bars[pk["pick_date"]][-1][4]   # 선정일 정규장 종가 (15:30 봉)
+        days = sorted(d for d in bars if d > pk["pick_date"])[:LEADER_SCALP_DAYS]
+        for n in need:
+            if n > len(days):
+                continue
+            day = days[n - 1]
+            if day == TODAY and now_hhmm < "1531":
+                continue                      # 장이 끝나야 계산
+            b = bars[day]
+            o, h, l, c = b[0][1], max(x[2] for x in b), min(x[3] for x in b), b[-1][4]
+            sim = simulate_leader_scalp(ref, o, _bars_to_ticks(b))
+            rows.append({"pick_date": pk["pick_date"], "code": pk["code"], "name": pk.get("name"),
+                         "theme_name": pk.get("theme_name"), "rank": pk.get("rank"), "day_no": n,
+                         "trade_date": day, "ref_close": ref, "day_open": o, "day_high": h, "day_low": l,
+                         "day_close": c, **{k: None for k in ("base_low", "base_high", "buy1_price", "buy1_time",
+                         "buy2_price", "buy2_time", "avg_price", "take_price", "stop_price", "exit_price",
+                         "exit_time", "exit_reason", "ret", "result")}, **sim})
+    if not rows:
+        return []
+    ok = supabase_request("POST", "leader_scalp", data=rows)
+    log(f"  ⚡ 주도주 단타 {len(rows)}건 저장 {'✅' if ok else '❌'}")
+    for r in rows:
+        if r["status"] == "done":
+            log(f"     {r['name']} {r['day_no']}일차 {r['mode']} 매수 {r['buy1_time']}"
+                f"{' +추가 ' + r['buy2_time'] if r['buy2_time'] else ''} → {r['exit_reason']} {r['exit_time']} {r['ret']:+.2f}%")
+        else:
+            log(f"     {r['name']} {r['day_no']}일차 {r['mode']} 매수 조건 안 옴")
+    return rows if ok else []
 
 
 # ── 급등주 급락 매수 (pullback_track) ──
@@ -5240,6 +5450,11 @@ def main():
         # 주도주 배팅: 기존 종목 갱신 → 오늘 주도 테마 대장 편입 (확정 종가 기준)
         track_closed += update_leader_track(krx_data) or []
         leader_new = seed_leader_track(select_leader_stocks(krx_data, theme_map)) or []
+        # 주도주 단타: 지난 선정분의 1·2일차 장중 매매를 분봉으로 계산
+        try:
+            update_leader_scalp()
+        except Exception as e:
+            log(f"  ⚠️ 주도주 단타 계산 실패 (계속 진행): {e}")
 
     # 10-2. 재료 포착 TOP 10 (close 모드에서만 — DART/뉴스 API 비용 + 확정 종가 필요)
     #        FORCE_CATALYST=1 이면 시간대·중복 여부 무관하게 강제 산출 (수동 실행/테스트용)
@@ -5424,6 +5639,7 @@ def main():
         supabase_request("DELETE", "oversold_track", params={"pick_date": f"lt.{cutoff_ot}"})
         cutoff_lt = (datetime.now() - timedelta(days=LEADER_TRACK_KEEP_DAYS)).strftime("%Y-%m-%d")
         supabase_request("DELETE", "leader_track", params={"pick_date": f"lt.{cutoff_lt}"})
+        supabase_request("DELETE", "leader_scalp", params={"pick_date": f"lt.{cutoff_lt}"})
         cutoff_pb = (datetime.now() - timedelta(days=PULLBACK_KEEP_DAYS)).strftime("%Y-%m-%d")
         supabase_request("DELETE", "pullback_track", params={"signal_date": f"lt.{cutoff_pb}"})
         log(f"  🧹 {cutoff_dp} 이전 일봉 / {cutoff_os} 이전 과대 낙폭 / {cutoff_ct} 이전 재료 포착 / {cutoff_ot} 이전 낙폭 성과 정리")

@@ -461,6 +461,7 @@ const BET_KINDS={
     title:"주도주 배팅 성과 추적",sub:"주도 테마 대장주 · 10일선 이탈 시 매도",
     intro:<>개별 종목이 아니라 <b style={{color:"#f97316"}}>테마가 통째로 오른 날</b>만 봅니다. 같은 테마 안에 <b>+10% 이상 · 거래대금 1,000억 이상</b> 종목이
       대장 포함 <b>3개 이상</b>이면 주도 테마로 보고, 그 안에서 상승률 + 거래대금이 가장 높은 <b>대장주</b>를 강한 테마 순으로 하루 최대 3종목 편입합니다.
+      단, <b>그날 고가를 찍은 뒤 1분봉 종가가 중심가((고가+저가)÷2) 아래로 내려갔던 종목</b>은 추세가 꺾인 것으로 보고 빼며, 다음 순위 종목이 대장이 됩니다.
       선정일 종가에 샀다고 가정하고, 정해 둔 익절·손절선 없이 <b>종가가 10일 이동평균선 아래로 내려가는 날 그 종가에 매도</b>합니다.
       매도할 때 수익이면 <b style={{color:"#22c55e"}}>익절</b>, 손실이면 <b style={{color:"#ef4444"}}>손절</b>로 표시합니다. 10일치 종가가 아직 없는 종목은 판단하지 않고 계속 보유합니다.
       종목을 누르면 함께 오른 종목과 그날 테마 뉴스를 볼 수 있습니다.</>,
@@ -476,7 +477,101 @@ const BET_KINDS={
     sql:"setup_pullback_track.sql",empty:"장 마감 후(15:35) 감시 종목이 급등일 시가 아래로 내려오면 쌓이기 시작합니다",
     note:r=>[`급등 ${String(r.signal_date||"").slice(5)} ${catPct(r.signal_change)}`,`시가 ₩${Math.round(Number(r.signal_open)||0).toLocaleString()}`,`${r.watch_days||0}일째 진입`,`거래대금 ${Math.round((Number(r.trading_value)||0)/1e8).toLocaleString()}억`].join(" · "),
     colLabel:"종목 · 급등일",watch:true},
+  scalp:{table:"leader_scalp",color:"#eab308",title:"주도주 단타 성과 추적",sub:"선정 다음날·다다음날 장중 매매 · +2% 익절",custom:true},
 };
+const SCALP_EXIT={tp:{l:"익절",c:"#22c55e",bg:"rgba(34,197,94,0.12)"},sl:{l:"손절",c:"#ef4444",bg:"rgba(239,68,68,0.12)"},close:{l:"장 마감 전 매도",c:"#3b82f6",bg:"rgba(59,130,246,0.12)"},none:{l:"매수 없음",c:"var(--dim)",bg:"var(--hover)"}};
+const won=v=>v===null||v===undefined?"—":`₩${Math.round(Number(v)).toLocaleString()}`;
+function LeaderScalp(){
+  const C="#eab308";
+  const[rows,setRows]=useState(null);const[err,setErr]=useState(false);const[exp,setExp]=useState(null);const[q,setQ]=useState("");
+  useEffect(()=>{let alive=true;
+    db("leader_scalp","order=pick_date.desc,rank.asc,day_no.asc&limit=2000").then(r=>{if(!alive)return;if(r===null){setErr(true);setRows([])}else setRows(r)});
+    return()=>{alive=false};
+  },[]);
+  if(rows===null)return <Loader/>;
+  const intro=<div style={{marginBottom:"16px",padding:"14px 16px",background:`${C}0d`,border:`1px solid ${C}26`,borderRadius:"10px",fontSize:"14px",lineHeight:1.7,color:"var(--text-sub)"}}>
+    <b style={{color:C}}>🔥 주도주로 선정된 종목</b>을 선정 <b>다음 거래일과 그다음 거래일</b>, 이틀 동안 하루 한 번씩 장중에 사고판다고 가정합니다. 기준가는 두 날 모두 <b>선정일 종가</b>이고, 같은 금액으로 두 번 나눠 삽니다.
+    <div style={{marginTop:"8px",display:"grid",gap:"4px"}}>
+      <div>▲ <b>시가가 기준가보다 높으면</b> — 기준가 ~ 그때까지 고가 구간의 아래에서 <b>1/4 지점 매수, 1/8 지점 추가 매수</b>. 기준가 아래로 내려가면 손절.</div>
+      <div>▼ <b>시가가 기준가 이하면</b> — 고가가 기준가 위로 올라간 뒤, 그때까지 저점 ~ 고가 구간의 <b>1/4 지점 매수, 1/8 지점 추가 매수</b>. 저점 아래로 내려가면 손절.</div>
+      <div>매수 가격은 1차 매수 때 정해지면 고정됩니다. 평균단가 <b style={{color:"#22c55e"}}>+2%면 익절</b>, 둘 다 안 닿으면 <b>15:20 동시호가 전 마지막 가격에 매도</b>하고, 15:20 뒤에는 새로 사지 않습니다.</div>
+    </div>
+    <span style={{color:"var(--dim)"}}> 정규장 1분봉(시·고·저·종)으로 계산하며, 1분 안의 순서는 양봉이면 시→저→고→종, 음봉이면 시→고→저→종으로 가정합니다. 지정가는 닿으면 체결, 손절은 이탈한 가격에 체결된 것으로 보고 수수료·세금은 반영하지 않았습니다.</span>
+  </div>;
+  if(!rows.length)return <div>{intro}<Empty msg={err?"단타 데이터를 불러오지 못했습니다 — Supabase에 leader_scalp 테이블(setup_leader_scalp.sql)을 만들었는지 확인하세요":"아직 기록이 없습니다 — 주도주가 선정된 다음 거래일 장 마감 후(15:35)부터 쌓입니다"}/></div>;
+
+  const done=rows.filter(r=>r.status==="done");
+  const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+  const rets=done.map(r=>Number(r.ret)).filter(v=>!isNaN(v));
+  const wins=done.filter(r=>r.result==="win").length;
+  const cnt=k=>done.filter(r=>r.exit_reason===k).length;
+  const byDay=n=>{const d=done.filter(r=>Number(r.day_no)===n);return{n:d.length,all:rows.filter(r=>Number(r.day_no)===n).length,avg:avg(d.map(r=>Number(r.ret)))}};
+  const d1=byDay(1),d2=byDay(2);
+  const cum=rets.reduce((x,y)=>x+y,0);
+  const match=r=>!q||[r.name,r.code,r.theme_name].some(v=>String(v||"").includes(q));
+  const dates=[...new Set(rows.map(r=>r.pick_date))];
+  const groups=dates.map(d=>{const all=rows.filter(r=>r.pick_date===d);const codes=[...new Set(all.map(r=>r.code))];
+    return{date:d,all,codes:codes.filter(c=>all.some(r=>r.code===c&&match(r))),themes:[...new Set(all.map(r=>r.theme_name).filter(Boolean))]}}).filter(g=>g.codes.length);
+  const COLS="70px 70px 1.2fr 96px 1.2fr 76px 92px";
+
+  return <div>
+    {intro}
+    <div className="cat-trk-stats" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+      <CatTrackStat label="승률 (수익 ÷ 매수)" value={done.length?`${(wins/done.length*100).toFixed(0)}%`:"—"} color={!done.length?"var(--dim)":(wins/done.length>=0.5?"#22c55e":"#ef4444")} sub={`${wins} / ${done.length}번 매수`}/>
+      <CatTrackStat label="평균 수익률 (1번 매매)" value={rets.length?catPct(avg(rets)):"—"} color={rets.length?catRetColor(avg(rets)):"var(--dim)"} sub={rets.length?`단순 합계 ${catPct(cum)}`:null}/>
+      <CatTrackStat label="익절 · 손절 · 장 마감 전" value={<span><span style={{color:"#22c55e"}}>{cnt("tp")}</span> · <span style={{color:"#ef4444"}}>{cnt("sl")}</span> · <span style={{color:"#3b82f6"}}>{cnt("close")}</span></span>} sub={`매수 없던 날 ${rows.length-done.length}번`}/>
+      <CatTrackStat label="1일차 · 2일차 평균" value={<span><span style={{color:d1.avg===null?"var(--dim)":catRetColor(d1.avg)}}>{d1.avg===null?"—":catPct(d1.avg)}</span> · <span style={{color:d2.avg===null?"var(--dim)":catRetColor(d2.avg)}}>{d2.avg===null?"—":catPct(d2.avg)}</span></span>} sub={`매수 ${d1.n}/${d1.all}번 · ${d2.n}/${d2.all}번`}/>
+    </div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px",flexWrap:"wrap",gap:"10px"}}>
+      <span style={{fontSize:"14px",fontWeight:700}}>🗓 선정일별</span>
+      <div style={{position:"relative"}}><input value={q} onChange={e=>setQ(e.target.value)} placeholder="종목·테마 검색" style={{background:"var(--inp-bg)",border:"1px solid var(--inp-bd)",borderRadius:"8px",padding:"9px 12px 9px 32px",color:"var(--text)",fontSize:"14px",width:200,outline:"none",fontFamily:"inherit"}}/><span style={{position:"absolute",left:11,top:"50%",transform:"translateY(-50%)",color:"var(--dim)",fontSize:"14px"}}>⌕</span></div>
+    </div>
+    {!groups.length&&<Empty msg="조건에 맞는 종목이 없습니다"/>}
+    <div style={{display:"grid",gap:"8px"}}>{groups.map((g,gi)=>{
+      const open=exp===g.date||(exp===null&&gi===0)||!!q;
+      const gd=g.all.filter(r=>r.status==="done"),gsum=gd.reduce((x,r)=>x+Number(r.ret||0),0);
+      return <Box key={g.date} style={{overflow:"hidden"}} hover={false}>
+        <div onClick={()=>setExp(open?"__none":g.date)} style={{display:"flex",alignItems:"center",gap:"12px",padding:"14px 18px",cursor:"pointer",flexWrap:"wrap"}}>
+          <span style={{fontSize:"15px",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{g.date}</span>
+          <span style={{fontSize:"13px",color:"var(--muted)"}}>{[...new Set(g.all.map(r=>r.code))].length}종목{g.themes.length>0&&<span style={{color:"#f97316",fontWeight:600}}> · 🔥 {g.themes.join(", ")}</span>}</span>
+          <span style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:"10px",fontSize:"13px",fontWeight:600}}>
+            <span style={{color:"var(--muted)"}}>매수 {gd.length}번</span>
+            {gd.length>0&&<span style={{color:catRetColor(gsum)}}>합계 {catPct(gsum)}</span>}
+            <span style={{color:"var(--dimmer)",fontSize:"16px",transform:open?"rotate(90deg)":"none",transition:"transform .2s"}}>›</span>
+          </span>
+        </div>
+        {open&&<div style={{borderTop:"1px solid var(--div3)",overflowX:"auto"}}>
+          <div style={{display:"grid",gridTemplateColumns:COLS,gap:"8px",padding:"10px 18px",background:"var(--row-head)",fontSize:"12px",color:"var(--muted)",fontWeight:600,minWidth:"780px"}}>
+            <span>일차</span><span>시가</span><span>매수 (1차 · 추가)</span><span style={{textAlign:"right"}}>평균단가</span><span>매도</span><span style={{textAlign:"right"}}>수익률</span><span style={{textAlign:"center"}}>결과</span>
+          </div>
+          {g.codes.map(code=>{const list=g.all.filter(r=>r.code===code);const f=list[0];
+            return <div key={code} style={{borderTop:"1px solid var(--div)",minWidth:"780px"}}>
+              <div style={{padding:"10px 18px 2px",fontSize:"14px"}}>
+                <a href={`https://stock.naver.com/domestic/stock/${code}/total`} target="_blank" rel="noopener noreferrer" style={{fontWeight:700,color:"var(--text)",textDecoration:"none"}}>{f.name}</a>
+                <span style={{marginLeft:"8px",fontSize:"12px",color:"var(--muted)"}}>🔥 {f.theme_name||"-"} · 기준가(선정일 종가) {won(f.ref_close)}</span>
+              </div>
+              {list.map(r=>{const up=r.mode==="up",ok=r.status==="done";const ex=SCALP_EXIT[ok?r.exit_reason:"none"]||SCALP_EXIT.none;
+                const gap=Number(r.ref_close)?(Number(r.day_open)-Number(r.ref_close))/Number(r.ref_close)*100:null;
+                return <div key={r.id} style={{display:"grid",gridTemplateColumns:COLS,gap:"8px",padding:"8px 18px",fontSize:"13px",alignItems:"center",fontVariantNumeric:"tabular-nums"}}>
+                  <span><b>{r.day_no}일차</b><div style={{fontSize:"11px",color:"var(--dim)"}}>{String(r.trade_date||"").slice(5)}</div></span>
+                  <span style={{color:up?"#ef4444":"#3b82f6",fontWeight:600}}>{up?"▲":"▼"} {gap===null?"":catPct(gap)}<div style={{fontSize:"11px",color:"var(--dim)",fontWeight:400}}>{won(r.day_open)}</div></span>
+                  <span>{ok?<>
+                    <div>{won(r.buy1_price)} <span style={{color:"var(--dim)"}}>{r.buy1_time}</span></div>
+                    <div style={{color:r.buy2_price?"var(--text-sub)":"var(--dim)"}}>{r.buy2_price?<>{won(r.buy2_price)} <span style={{color:"var(--dim)"}}>{r.buy2_time}</span></>:"추가 매수 없음"}</div>
+                  </>:<span style={{color:"var(--dim)"}}>{up?"1/4 지점까지 안 내려옴":"고가가 기준가 위로 안 올라감 또는 1/4 지점 안 옴"}</span>}</span>
+                  <span style={{textAlign:"right"}}>{ok?won(r.avg_price):"—"}{ok&&<div style={{fontSize:"11px",color:"var(--dim)"}}>손절 {won(r.stop_price)}</div>}</span>
+                  <span>{ok?<>{won(r.exit_price)} <span style={{color:"var(--dim)"}}>{r.exit_time}</span></>:"—"}</span>
+                  <span style={{textAlign:"right",fontWeight:700,color:ok?catRetColor(r.ret):"var(--dim)"}}>{ok?catPct(r.ret):"—"}</span>
+                  <span style={{textAlign:"center"}}><span style={{fontSize:"12px",fontWeight:700,color:ex.c,background:ex.bg,padding:"3px 8px",borderRadius:"5px",whiteSpace:"nowrap"}}>{ex.l}</span></span>
+                </div>})}
+            </div>})}
+        </div>}
+      </Box>})}</div>
+    <div style={{marginTop:"14px",padding:"12px 16px",background:"var(--card-bg)",border:"1px solid var(--div2)",borderRadius:"10px",fontSize:"13px",lineHeight:1.65,color:"var(--dim)"}}>
+      ⚠️ 과거 성과는 미래 수익을 보장하지 않습니다. 1분봉으로 재구성한 가상 매매라 실제 호가·체결 순서·수수료·세금과 다를 수 있습니다. 투자 추천이 아니며 판단과 책임은 본인에게 있습니다.
+    </div>
+  </div>;
+}
 function PullbackWatch({rows,expiredN,color}){
   const[open,setOpen]=useState(true);
   return <Box style={{marginBottom:"16px",overflow:"hidden"}} hover={false}>
@@ -652,10 +747,10 @@ function TabStocks({cat,loading}){
     <h2 style={{fontSize:"20px",fontWeight:700,marginBottom:"14px"}}><span style={{color:BET_KINDS[trk].color}}>📈</span> {BET_KINDS[trk].title} <span style={{fontSize:"14px",color:"var(--dim)",fontWeight:400}}>{BET_KINDS[trk].sub}</span></h2>
     {viewToggle}
     <div style={{display:"flex",gap:"6px",marginBottom:"14px",flexWrap:"wrap"}}>
-      {[{id:"oversold",l:"▼ 과대 낙폭"},{id:"leader",l:"🔥 주도주"},{id:"pullback",l:"📉 급등주 급락"}].map(v=>{const on=trk===v.id,c=BET_KINDS[v.id].color;
+      {[{id:"oversold",l:"▼ 과대 낙폭"},{id:"leader",l:"🔥 주도주"},{id:"scalp",l:"⚡ 주도주 단타"},{id:"pullback",l:"📉 급등주 급락"}].map(v=>{const on=trk===v.id,c=BET_KINDS[v.id].color;
         return <button key={v.id} onClick={()=>pickTrk(v.id)} style={{padding:"8px 16px",fontFamily:"inherit",fontSize:"14px",fontWeight:700,border:"1px solid",borderColor:on?c:"var(--div2)",background:on?`${c}1a`:"transparent",color:on?c:"var(--muted)",borderRadius:"18px",cursor:"pointer"}}>{v.l}</button>})}
     </div>
-    <BetTrack kind={trk}/>
+    {trk==="scalp"?<LeaderScalp/>:<BetTrack kind={trk}/>}
   </div>;
   const stamp=cat.length?`${cat[0].date}${cat[0].generated_time?` ${cat[0].generated_time}`:""} 기준`:"";
   const intro=<div style={{marginBottom:"16px",padding:"14px 16px",background:"rgba(245,158,11,0.05)",border:"1px solid rgba(245,158,11,0.15)",borderRadius:"10px"}}>
