@@ -1864,10 +1864,17 @@ function MtForm({init,mode,defPublic,onSave,onCancel,fillsOk}){
   const[stock,setStock]=useState(init?{code:init.code,name:init.name,market:init.market}:null);
   const hold=init&&init.status==="open"&&init.qty!=null?Number(init.qty):null;
   const[f,setF]=useState(()=>init?{buy_date:init.buy_date,buy_price:init.buy_price,qty:init.qty??"",buy_reason:init.buy_reason||"",memo:init.memo||"",is_public:init.is_public,sell_date:init.sell_date||mtToday(),sell_price:init.status==="open"?(init.last_price!=null?Math.round(init.last_price):""):(init.sell_price??""),sell_reason:init.sell_reason||"",
-      sell_qty:hold??"",b2_date:mtToday(),b2_price:init.last_price!=null?Math.round(init.last_price):"",b2_qty:"",b2_memo:"",first_qty:""}:{buy_date:mtToday(),buy_price:"",qty:"",buy_reason:"",memo:"",is_public:!!defPublic});
+      sell_qty:hold??"",b2_date:mtToday(),b2_price:init.last_price!=null?Math.round(init.last_price):"",b2_qty:"",b2_memo:"",first_qty:"",amt:"",b2_amt:""}:{buy_date:mtToday(),buy_price:"",qty:"",amt:"",buy_reason:"",memo:"",is_public:!!defPublic});
   const[busy,setBusy]=useState(false);const[err,setErr]=useState("");
   const set=(k,v)=>setF(o=>({...o,[k]:v}));
-  const pick=x=>{setStock(x);if(x.price&&!f.buy_price)set("buy_price",x.price)};
+  // 매수 금액 → 수량 자동 계산 (금액 ÷ 가격, 1주 미만 버림). 금액은 저장하지 않고 수량만 저장
+  const fq=(a,p)=>{a=Number(a);p=Number(p);return a>0&&p>0?Math.floor(a/p):""};
+  const setAmt=(ka,kq,kp,v)=>setF(o=>({...o,[ka]:v,[kq]:v===""?o[kq]:fq(v,o[kp])}));
+  const setPrice=(ka,kq,kp,v)=>setF(o=>({...o,[kp]:v,...(o[ka]!==""?{[kq]:fq(o[ka],v)}:{})}));
+  const setQty=(ka,kq,v)=>setF(o=>({...o,[kq]:v,[ka]:""}));
+  const amtHint=(a,p,q)=>{a=Number(a);p=Number(p);q=Number(q);if(!(a>0)||!(p>0))return null;
+    return <div style={{marginTop:"6px",fontSize:"13px",color:q>0?"var(--muted)":"#ef4444"}}>{q>0?<>{mtWon(p)} × <b style={{color:"var(--text)"}}>{q.toLocaleString()}주</b> = {mtWon(p*q)} · 남는 금액 {mtWon(a-p*q)}</>:"이 금액으로는 1주도 살 수 없습니다"}</div>};
+  const pick=x=>{setStock(x);if(x.price&&!f.buy_price)setPrice("amt","qty","buy_price",x.price)};
   const avg=init?Number(init.buy_price):0;
   const save=async()=>{setErr("");
     let row;
@@ -1875,12 +1882,13 @@ function MtForm({init,mode,defPublic,onSave,onCancel,fillsOk}){
       if(fillsOk){const q=f.sell_qty===""?null:Number(f.sell_qty);if(q!=null&&!(q>0))return setErr("매도 수량을 확인하세요");if(hold!=null&&q!=null&&q>hold)return setErr(`보유 수량(${hold.toLocaleString()})보다 많이 팔 수 없습니다`);
         row={fill:{side:"sell",date:f.sell_date,price:Number(f.sell_price),qty:hold!=null&&q===hold?null:q,memo:""},trade:{sell_reason:f.sell_reason.slice(0,500)}}}
       else row={status:"closed",sell_date:f.sell_date,sell_price:Number(f.sell_price),sell_reason:f.sell_reason.slice(0,500)}}
-    else if(mode==="buy2"){if(!(Number(f.b2_price)>0)||!f.b2_date)return setErr("날짜와 가격을 입력하세요");if(!(Number(f.b2_qty)>0))return setErr("추가로 산 수량을 입력하세요");
+    else if(mode==="buy2"){if(!(Number(f.b2_price)>0)||!f.b2_date)return setErr("날짜와 가격을 입력하세요");if(f.b2_amt!==""&&!(Number(f.b2_qty)>0))return setErr("금액이 가격보다 작아 1주도 살 수 없습니다");if(!(Number(f.b2_qty)>0))return setErr("추가로 산 수량을 입력하세요");
       if(init.qty==null&&!(Number(f.first_qty)>0))return setErr("처음 산 수량을 입력하세요 (평균단가 계산에 필요)");
       if(f.b2_date<init.buy_date)return setErr("첫 매수일보다 앞선 날짜는 넣을 수 없습니다");
       row={fill:{side:"buy",date:f.b2_date,price:Number(f.b2_price),qty:Number(f.b2_qty),memo:f.b2_memo.slice(0,300)},firstQty:init.qty==null?Number(f.first_qty):null}}
     else if(mode==="edit"&&fillsOk){row={buy_reason:f.buy_reason.slice(0,500),memo:f.memo.slice(0,1000),is_public:!!f.is_public};if(init.status==="closed")row.sell_reason=f.sell_reason.slice(0,500)}
     else{if(!stock)return setErr("종목을 고르세요");if(!(Number(f.buy_price)>0))return setErr("매수가를 입력하세요");if(!f.buy_date)return setErr("매수일을 입력하세요");
+      if(f.amt!==""&&!(Number(f.qty)>0))return setErr("금액이 매수가보다 작아 1주도 살 수 없습니다");
       row={buy_date:f.buy_date,buy_price:Number(f.buy_price),qty:f.qty===""?null:Number(f.qty),buy_reason:f.buy_reason.slice(0,500),memo:f.memo.slice(0,1000),is_public:!!f.is_public};
       if(mode==="add")Object.assign(row,{code:stock.code,name:stock.name.slice(0,40),market:stock.market||""})}
     setBusy(true);try{await onSave(row)}catch(e){setErr(mtErr(e))}setBusy(false)};
@@ -1896,10 +1904,12 @@ function MtForm({init,mode,defPublic,onSave,onCancel,fillsOk}){
       <div style={{fontSize:"13px",color:"var(--muted)"}}>지금 평균단가 <b style={{color:"var(--text)"}}>{mtWon(avg)}</b>{init.qty!=null?` × ${Number(init.qty).toLocaleString()}`:""}</div>
       <div style={grid}>
         <div>{lab("추가 매수일")}<input type="date" style={mtInp} value={f.b2_date} min={init.buy_date} max={mtToday()} onChange={e=>set("b2_date",e.target.value)}/></div>
-        <div>{lab("가격 (원)")}<input type="number" inputMode="decimal" style={mtInp} value={f.b2_price} onChange={e=>set("b2_price",e.target.value)}/></div>
-        <div>{lab("수량 (나만 보임)")}<input type="number" inputMode="decimal" style={mtInp} value={f.b2_qty} onChange={e=>set("b2_qty",e.target.value)}/></div>
+        <div>{lab("가격 (원)")}<input type="number" inputMode="decimal" style={mtInp} value={f.b2_price} onChange={e=>setPrice("b2_amt","b2_qty","b2_price",e.target.value)}/></div>
+        <div>{lab("매수 금액 (넣으면 수량 자동)")}<input type="number" inputMode="numeric" style={mtInp} placeholder="예: 1000000" value={f.b2_amt} onChange={e=>setAmt("b2_amt","b2_qty","b2_price",e.target.value)}/></div>
+        <div>{lab("수량 (나만 보임)")}<input type="number" inputMode="decimal" style={mtInp} value={f.b2_qty} onChange={e=>setQty("b2_amt","b2_qty",e.target.value)}/></div>
         {init.qty==null&&<div>{lab(`처음(${init.buy_date}) 산 수량`)}<input type="number" inputMode="decimal" style={mtInp} value={f.first_qty} onChange={e=>set("first_qty",e.target.value)}/></div>}
       </div>
+      {amtHint(f.b2_amt,f.b2_price,f.b2_qty)}
       {newAvg&&<div style={{marginTop:"8px",fontSize:"14px"}}>평균단가 {mtWon(avg)} → <b>{mtWon(newAvg)}</b> <span style={{color:"var(--dim)",fontSize:"13px"}}>({catPct((newAvg/avg-1)*100)}) · 보유 {(h0+b2q).toLocaleString()}</span></div>}
       {lab("메모 (선택 · 예: 20일선 지지 확인 후 물타기)")}<input style={mtInp} maxLength={300} value={f.b2_memo} onChange={e=>set("b2_memo",e.target.value)}/>
     </>:mode==="edit"&&fillsOk?<>
@@ -1911,9 +1921,11 @@ function MtForm({init,mode,defPublic,onSave,onCancel,fillsOk}){
     </>:mode!=="sell"?<>
       <div style={grid}>
         <div>{lab("매수일")}<input type="date" style={mtInp} value={f.buy_date} max={mtToday()} onChange={e=>set("buy_date",e.target.value)}/></div>
-        <div>{lab("매수가 (원)")}<input type="number" inputMode="decimal" style={mtInp} value={f.buy_price} onChange={e=>set("buy_price",e.target.value)}/></div>
-        <div>{lab("수량 (선택 · 나만 보임)")}<input type="number" inputMode="decimal" style={mtInp} value={f.qty} onChange={e=>set("qty",e.target.value)}/></div>
+        <div>{lab("매수가 (원)")}<input type="number" inputMode="decimal" style={mtInp} value={f.buy_price} onChange={e=>setPrice("amt","qty","buy_price",e.target.value)}/></div>
+        <div>{lab("매수 금액 (선택 · 넣으면 수량 자동)")}<input type="number" inputMode="numeric" style={mtInp} placeholder="예: 1000000" value={f.amt} onChange={e=>setAmt("amt","qty","buy_price",e.target.value)}/></div>
+        <div>{lab("수량 (선택 · 나만 보임)")}<input type="number" inputMode="decimal" style={mtInp} value={f.qty} onChange={e=>setQty("amt","qty",e.target.value)}/></div>
       </div>
+      {amtHint(f.amt,f.buy_price,f.qty)}
       {lab("매수 이유 (선택 · 공개하면 다른 사람도 봄)")}<textarea style={{...mtInp,minHeight:56,resize:"vertical"}} maxLength={500} placeholder="예: 52주 신고가 돌파 + 외국인 순매수" value={f.buy_reason} onChange={e=>set("buy_reason",e.target.value)}/>
       {lab("메모 (선택 · 나만 보임)")}<textarea style={{...mtInp,minHeight:44,resize:"vertical"}} maxLength={1000} value={f.memo} onChange={e=>set("memo",e.target.value)}/>
       <label style={{display:"flex",gap:"8px",alignItems:"center",marginTop:"10px",fontSize:"14px",cursor:"pointer"}}><input type="checkbox" checked={!!f.is_public} onChange={e=>set("is_public",e.target.checked)}/>🌐 공개 매매에 올리기 <span style={{color:"var(--dim)",fontSize:"12.5px"}}>(닉네임·종목·매수일·매수가·수익률·매수 이유만, 수량·메모는 비공개)</span></label>
