@@ -1945,9 +1945,11 @@ function MtForm({init,mode,defPublic,onSave,onCancel,fillsOk}){
   </Box>;
 }
 
-function MtCard({tr,run,mine,fills,fillsOk,onEdit,onSell,onBuy2,onDelete,onReopen,onPublic,onFillSave,onFillDelete}){
+function MtCard({tr,run,mine,fills,fillsOk,live,onEdit,onSell,onBuy2,onDelete,onReopen,onPublic,onFillSave,onFillDelete}){
   const[open,setOpen]=useState(false);const[ask,setAsk]=useState(false);
-  const closed=tr.status==="closed";const r=tr.ret_cum;const lt=tr.latest||{};
+  const closed=tr.status==="closed";const lt=tr.latest||{};
+  const lv=!closed&&live&&Number(live.price)>0?live:null;const r=mtRet(tr,lv);
+  const evalPnl=lv&&mine&&tr.qty!=null?(Number(lv.price)-Number(tr.buy_price))*Number(tr.qty):null;
   const multi=(tr.n_buys||0)>1||(!closed&&(tr.n_sells||0)>0)||(closed&&(tr.n_sells||0)>1);
   const rp=tr.realized_pnl!=null?Number(tr.realized_pnl):null;
   return <Box hover={false} style={{overflow:"hidden",opacity:closed?.92:1}}>
@@ -1961,17 +1963,19 @@ function MtCard({tr,run,mine,fills,fillsOk,onEdit,onSell,onBuy2,onDelete,onReope
         </div>
         {multi?<div style={{fontSize:"13px",color:"var(--muted)",marginTop:"3px"}}>
           {tr.buy_date} 첫 매수 {mtWon(tr.first_buy_price)} · <b style={{color:"var(--text)"}}>평균 {mtWon(tr.buy_price)}</b>{mine&&tr.qty?` × ${Number(tr.qty).toLocaleString()}`:""}
-          {closed?` → ${tr.sell_date} 매도 평균 ${mtWon(tr.sell_price)}`:tr.last_price?` → ${mtWon(tr.last_price)}`:""}{tr.days_held!=null?` · ${tr.days_held}거래일`:""}
+          {closed?` → ${tr.sell_date} 매도 평균 ${mtWon(tr.sell_price)}`:(lv||tr.last_price)?` → ${mtWon(lv?lv.price:tr.last_price)}`:""}{tr.days_held!=null?` · ${tr.days_held}거래일`:""}
           <span style={{marginLeft:"6px",fontSize:"12px",padding:"1px 7px",borderRadius:"10px",background:"var(--badge-bg)"}}>매수 {tr.n_buys||1}{tr.n_sells?` · 매도 ${tr.n_sells}`:""}</span>
           {mine&&!closed&&rp!=null&&<span style={{marginLeft:"6px",color:catRetColor(rp)}}>실현 {(rp>=0?"+":"")+Math.round(rp).toLocaleString()}원</span>}
         </div>
-        :<div style={{fontSize:"13px",color:"var(--muted)",marginTop:"3px"}}>{tr.buy_date} 매수 {mtWon(tr.buy_price)}{mine&&tr.qty?` × ${Number(tr.qty).toLocaleString()}`:""}{closed?` → ${tr.sell_date} 매도 ${mtWon(tr.sell_price)}`:tr.last_price?` → ${mtWon(tr.last_price)}`:""}{tr.days_held!=null?` · ${tr.days_held}거래일`:""}</div>}
+        :<div style={{fontSize:"13px",color:"var(--muted)",marginTop:"3px"}}>{tr.buy_date} 매수 {mtWon(tr.buy_price)}{mine&&tr.qty?` × ${Number(tr.qty).toLocaleString()}`:""}{closed?` → ${tr.sell_date} 매도 ${mtWon(tr.sell_price)}`:(lv||tr.last_price)?` → ${mtWon(lv?lv.price:tr.last_price)}`:""}{tr.days_held!=null?` · ${tr.days_held}거래일`:""}</div>}
+        {lv&&<div style={{fontSize:"13px",marginTop:"3px",fontVariantNumeric:"tabular-nums"}}><span style={{color:"var(--muted)"}}>오늘 </span><b style={{color:catRetColor(Number(lv.change_pct))}}>{catPct(Number(lv.change_pct))}</b><span style={{color:"var(--dim)",fontSize:"12px"}}> · {mtWon(lv.price)} · {mtLiveTime(lv.updated_at)} 기준</span></div>}
         {!closed&&lt.waiting&&<div style={{fontSize:"12.5px",color:"var(--dim)",marginTop:"3px"}}>⏳ {lt.note}</div>}
         {!closed&&!tr.last_date&&<div style={{fontSize:"12.5px",color:"var(--dim)",marginTop:"3px"}}>⏳ 첫 분석 대기 중 (몇 분 안에, 늦어도 장 마감 후)</div>}
         {!closed&&lt.signals?.length>0&&!open&&<div style={{fontSize:"12.5px",color:"var(--muted)",marginTop:"3px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{lt.signals.filter(x=>x.tone).slice(0,3).map(x=>(x.tone>0?"▲ ":"▼ ")+x.label).join(" · ")}</div>}
       </div>
       <div style={{textAlign:"right",fontVariantNumeric:"tabular-nums"}}>
         <div style={{fontWeight:800,fontSize:"19px",color:r==null?"var(--dim)":catRetColor(r)}}>{r==null?"-":catPct(r)}</div>
+        {evalPnl!=null&&<div style={{fontSize:"11.5px",color:catRetColor(evalPnl)}}>평가 {(evalPnl>=0?"+":"")+Math.round(evalPnl).toLocaleString()}원</div>}
         {mine&&closed&&rp!=null&&<div style={{fontSize:"11.5px",color:catRetColor(rp)}}>{(rp>=0?"+":"")+Math.round(rp).toLocaleString()}원</div>}
         {tr.max_ret!=null&&<div style={{fontSize:"11.5px",color:"var(--dim)"}}>최고 {catPct(tr.max_ret)} · 최저 {catPct(tr.min_ret)}</div>}
         {!closed&&lt.pred?.d20&&<div style={{fontSize:"11.5px",color:"var(--dim)"}}>20일 뒤 상승 {Math.round(lt.pred.d20.p_up*100)}%</div>}
@@ -1989,10 +1993,15 @@ function MtCard({tr,run,mine,fills,fillsOk,onEdit,onSell,onBuy2,onDelete,onReope
   </Box>;
 }
 
-function MtStats({list}){
-  const cl=list.filter(t=>t.status==="closed"&&t.ret_cum!=null);const op=list.filter(t=>t.status==="open"&&t.ret_cum!=null);
+// 보유 중이면 지금 시세(크롤링이 5분마다 저장) 기준 수익률, 아니면 분석 때 계산한 수익률
+function mtRet(t,lv){if(t.status!=="closed"&&lv&&Number(lv.price)>0&&Number(t.buy_price)>0)return(Number(lv.price)/Number(t.buy_price)-1)*100;return t.ret_cum==null?null:Number(t.ret_cum)}
+function mtLiveTime(iso){if(!iso)return"";const d=new Date(iso),k=new Date(d.getTime()+(d.getTimezoneOffset()+540)*60000),n=new Date(Date.now()+(new Date().getTimezoneOffset()+540)*60000);
+  const hm=String(k.getHours()).padStart(2,"0")+":"+String(k.getMinutes()).padStart(2,"0");return k.toDateString()===n.toDateString()?hm:`${k.getMonth()+1}/${k.getDate()} ${hm}`}
+function MtStats({list,live}){
+  const rr=t=>mtRet(t,live&&live[t.code]);
+  const cl=list.filter(t=>t.status==="closed"&&t.ret_cum!=null);const op=list.filter(t=>t.status==="open"&&rr(t)!=null);
   if(!cl.length&&!op.length)return null;
-  const avg=a=>a.reduce((s,t)=>s+Number(t.ret_cum),0)/a.length;
+  const avg=a=>a.reduce((s,t)=>s+rr(t),0)/a.length;
   const win=cl.filter(t=>Number(t.ret_cum)>0).length;
   const cell=(l,v,c)=><div style={{padding:"10px 14px",border:"1px solid var(--card-bd)",borderRadius:"10px",background:"var(--card-bg)"}}><div style={{fontSize:"12px",color:"var(--muted)"}}>{l}</div><div style={{fontSize:"18px",fontWeight:800,color:c||"var(--text)"}}>{v}</div></div>;
   return <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"8px",marginBottom:"12px"}}>
@@ -2009,6 +2018,7 @@ function TabMyTrade(){
   const[form,setForm]=useState(null);const[err,setErr]=useState("");const[nick,setNick]=useState("");const[showSet,setShowSet]=useState(false);const[askDel,setAskDel]=useState(false);
   const[pubFilter,setPubFilter]=useState("open");
   const[fillsBy,setFillsBy]=useState({});const[fillsOk,setFillsOk]=useState(false);const[pubFills,setPubFills]=useState({});
+  const[live,setLive]=useState({});
   useEffect(()=>{try{localStorage.setItem("sp-mt-view",view)}catch(e){}},[view]);
   useEffect(()=>{
     sbClient.auth.getSession().then(({data})=>setSession(data.session||null));
@@ -2038,6 +2048,15 @@ function TabMyTrade(){
     sbClient.from("mt_public_fills").select("id,trade_id,side,date,price").order("date").order("id").limit(3000).then(({data,error})=>{setPubFills(error?{}:mtGroupFills(data))})},[view]);
   // 분석이 아직 안 된 매매가 있으면 1분마다 다시 확인
   useEffect(()=>{if(!trades||!trades.some(t=>t.status==="open"&&!t.last_date))return;const t=setInterval(()=>{if(document.visibilityState==="visible")loadMine()},60000);return()=>clearInterval(t)},[trades,loadMine]);
+
+  // 보유 종목 지금 시세 (크롤링이 5분마다 mt_stock_list에 저장) — 탭이 보일 때 1분마다
+  const liveCodes=[...new Set([...(trades||[]),...(view==="public"?(pub||[]):[])].filter(t=>t.status==="open").map(t=>t.code))].sort().join(",");
+  useEffect(()=>{if(!liveCodes)return;let dead=false;
+    const load=async()=>{const{data,error}=await sbClient.from("mt_stock_list").select("code,price,change_pct,updated_at").in("code",liveCodes.split(","));
+      if(!dead&&!error&&data)setLive(Object.fromEntries(data.map(x=>[x.code,x])))};
+    load();const t=setInterval(()=>{if(document.visibilityState==="visible")load()},60000);
+    const vis=()=>{if(document.visibilityState==="visible")load()};document.addEventListener("visibilitychange",vis);
+    return()=>{dead=true;clearInterval(t);document.removeEventListener("visibilitychange",vis)}},[liveCodes]);
 
   const login=async()=>{setErr("");try{localStorage.setItem("sp-login-return","mytrade")}catch(e){}
     const{error}=await sbClient.auth.signInWithOAuth({provider:"google",options:{redirectTo:location.origin+location.pathname}});
@@ -2109,17 +2128,17 @@ function TabMyTrade(){
       {form&&<MtForm key={form.mode+(form.tr?.id||"")} mode={form.mode} init={form.tr} defPublic={prof?.default_public} fillsOk={fillsOk} onCancel={()=>setForm(null)}
         onSave={row=>form.mode==="add"?addTrade(row):row.fill?addFill(form.tr,row):updTrade(form.tr.id,row)}/>}
       {trades===null?<Loader/>:<>
-        <MtStats list={trades}/>
+        <MtStats list={trades} live={live}/>
         {!trades.length&&!form&&<Box hover={false} style={{padding:"30px",textAlign:"center",color:"var(--dim)"}}>아직 기록이 없습니다. <b>＋ 매수 기록</b>으로 첫 종목을 넣어 보세요.</Box>}
-        <div style={{display:"grid",gap:"10px"}}>{trades.map(t=><MtCard key={t.id} tr={t} run={run} mine fills={fillsBy[t.id]} {...act}/>)}</div>
+        <div style={{display:"grid",gap:"10px"}}>{trades.map(t=><MtCard key={t.id} tr={t} run={run} mine fills={fillsBy[t.id]} live={live[t.code]} {...act}/>)}</div>
       </>}
     </>)}
 
     {view==="public"&&(pub===null?<Loader/>:<>
       <div style={{display:"flex",gap:"6px",marginBottom:"12px",flexWrap:"wrap"}}>{[["open","보유 중"],["closed","매도 완료"],["all","전체"]].map(([k,l])=><button key={k} onClick={()=>setPubFilter(k)} style={{...mtBtn,padding:"5px 12px",borderRadius:"16px",borderColor:pubFilter===k?"var(--accent)":"var(--card-bd)",color:pubFilter===k?"var(--text)":"var(--muted)",fontWeight:pubFilter===k?700:500}}>{l} {(pub||[]).filter(t=>k==="all"||t.status===k).length}</button>)}</div>
-      <MtStats list={pubList}/>
+      <MtStats list={pubList} live={live}/>
       {!pubList.length&&<Box hover={false} style={{padding:"30px",textAlign:"center",color:"var(--dim)"}}>공개된 매매가 없습니다</Box>}
-      <div style={{display:"grid",gap:"10px"}}>{pubList.map(t=><MtCard key={t.id} tr={t} run={run} fills={pubFills[t.id]}/>)}</div>
+      <div style={{display:"grid",gap:"10px"}}>{pubList.map(t=><MtCard key={t.id} tr={t} run={run} fills={pubFills[t.id]} live={live[t.code]}/>)}</div>
     </>)}
 
     <div style={{marginTop:"16px",padding:"12px 16px",background:"rgba(245,158,11,0.04)",border:"1px solid rgba(245,158,11,0.12)",borderRadius:"10px",fontSize:"13.5px",color:"#b4940f",lineHeight:1.7}}>⚠️ 분석은 장 마감 후 하루 1번(17시쯤) 공개 데이터로 자동 계산되며, 예측은 과거 패턴에 기반한 확률일 뿐 미래 수익을 보장하지 않습니다. 매수·매도 판단은 본인 책임이며, 이 화면은 투자 권유가 아닌 기록·정보 제공 목적입니다.</div>

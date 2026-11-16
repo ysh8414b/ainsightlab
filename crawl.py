@@ -526,6 +526,57 @@ def fetch_naver_market_data(sector_map=None):
 
 
 # ─────────────────────────────────────────
+# 내 매매 — 보유 종목 현재가 (5분마다, 화면의 '오늘 등락률·지금 수익률'용)
+# ─────────────────────────────────────────
+def update_mt_live_prices(krx_data):
+    """mt_trades 보유 중(open) 종목의 지금 시세를 mt_stock_list(price·change_pct·updated_at)에 저장.
+    krx_data에 없는 종목(ETF·우선주 등)은 네이버 종목 시세를 하나씩 조회. 실패해도 크롤링 계속"""
+    if not SUPABASE_KEY:
+        return
+    hdr = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/mt_trades", headers=hdr,
+                         params={"select": "code,name,market", "status": "eq.open", "limit": "5000"}, timeout=20)
+        if r.status_code != 200:
+            return  # 테이블 없음 등
+        held = {}
+        for t in r.json():
+            c = (t.get("code") or "").strip()
+            if len(c) == 6:
+                held.setdefault(c, t)
+        if not held:
+            return
+        now_iso = datetime.now(timezone(timedelta(hours=9))).isoformat()
+        rows = []
+        for c, t in held.items():
+            d = krx_data.get(c)
+            if d and d.get("price"):
+                rows.append({"code": c, "name": d["name"], "market": d.get("market") or t.get("market") or "",
+                             "price": d["price"], "change_pct": d.get("change_pct", 0), "updated_at": now_iso})
+                continue
+            try:
+                b = requests.get(f"https://m.stock.naver.com/api/stock/{c}/basic",
+                                 headers=NAVER_STOCK_HEADERS, timeout=10).json()
+                price = float(str(b.get("closePrice", "")).replace(",", ""))
+                pct = float(str(b.get("fluctuationsRatio", "0")).replace(",", ""))
+                if price > 0:
+                    rows.append({"code": c, "name": b.get("stockName") or t.get("name") or c,
+                                 "market": t.get("market") or "", "price": price, "change_pct": pct, "updated_at": now_iso})
+            except Exception:
+                pass
+        if not rows:
+            return
+        u = requests.post(f"{SUPABASE_URL}/rest/v1/mt_stock_list", params={"on_conflict": "code"},
+                          headers={**hdr, "Prefer": "resolution=merge-duplicates,return=minimal"}, json=rows, timeout=30)
+        if u.status_code in (200, 201, 204):
+            log(f"  💼 내 매매 보유 종목 현재가 {len(rows)}/{len(held)}개 갱신")
+        else:
+            log(f"  ⚠️ 내 매매 현재가 저장 실패: HTTP {u.status_code} {u.text[:150]}")
+    except Exception as e:
+        log(f"  ⚠️ 내 매매 현재가 갱신 실패: {e}")
+
+
+# ─────────────────────────────────────────
 # KRX 데이터 (Fallback)
 # ─────────────────────────────────────────
 def _fetch_krx_for_date(date_str, mkt_id, mkt_name):
@@ -5112,6 +5163,9 @@ def main():
         if oversold_intraday:
             log(f"     → 과대 낙폭 장중 갱신 스킵")
             oversold_intraday = False
+
+    # 2-1. 내 매매 보유 종목 현재가 (화면의 오늘 등락률·지금 수익률)
+    update_mt_live_prices(krx_data)
 
     # 3. 종목코드 매핑 구축 (AI 테마 코드 보정용)
     global KNOWN_STOCK_CODES

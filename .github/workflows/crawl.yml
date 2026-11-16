@@ -147,7 +147,8 @@ jobs:
           if [ "${NEW:0:2}" = "[{" ]; then WHY="새 매매 분석"; fi
           if [ -z "$WHY" ] && [ "$DOW" -le 5 ] && [ "$HM" -ge 1705 ]; then
             OPEN=$(curl -s "$SUPABASE_URL/rest/v1/mt_trades?select=id&status=eq.open&limit=1" "${H[@]}")
-            RUN=$(curl -s "$SUPABASE_URL/rest/v1/mt_runs?select=id&created_at=gte.${TODAY}T00:00:00%2B09:00&limit=1" "${H[@]}")
+            # 오늘 날짜 분석이 있거나, 17시 이후 실행이 있으면(휴장일) 됨 — 아침에 늦게 돈 전날 분석은 세지 않음
+            RUN=$(curl -s "$SUPABASE_URL/rest/v1/mt_runs?select=id&or=(date.eq.${TODAY},created_at.gte.${TODAY}T17:00:00%2B09:00)&limit=1" "${H[@]}")
             if [ "${OPEN:0:2}" = "[{" ] && [ "$RUN" = "[]" ]; then WHY="오늘 정기 분석"; fi
           fi
           if [ -z "$WHY" ]; then echo "내 매매 분석 필요 없음"; exit 0; fi
