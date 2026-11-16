@@ -27,6 +27,7 @@ import os
 import re
 import json
 import html
+import math
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -1733,31 +1734,41 @@ def detect_themes_rule_based(news_titles, theme_map=None, krx_data=None):
 
     # ── 테마별 평균 등락률 계산 (krx_data 활용) ──
     theme_changes = {}
+    theme_tvs = {}   # 테마 대표 종목(최대 10개) 거래대금 합
     if krx_data:
         for theme_name in valid_scores:
             stocks = theme_map.get(theme_name, [])
             changes = []
+            tv_sum = 0
             for s in stocks[:10]:
                 code = s["code"] if isinstance(s, dict) else s
                 d = krx_data.get(code)
                 if d and d.get("price", 0) > 0:
                     changes.append(d["change_pct"])
+                    tv_sum += d.get("trading_value", 0) or 0
             if changes:
                 theme_changes[theme_name] = sum(changes) / len(changes)
+                theme_tvs[theme_name] = tv_sum
 
-    # ── 복합 점수: 뉴스(50%) + 등락률(50%) ──
+    # ── 복합 점수: 뉴스(20%) + 거래대금(40%) + 등락률(40%) ──
     max_news = max(valid_scores.values()) if valid_scores and max(valid_scores.values()) > 0 else 1
     change_values = [v for v in theme_changes.values()]
     max_change = max(change_values) if change_values else 1
     min_change = min(change_values) if change_values else 0
     change_range = max_change - min_change if max_change != min_change else 1
+    # 거래대금은 로그로 정규화 — 삼성전자·하이닉스가 든 반도체 테마가 늘 만점이 되지 않도록
+    tv_logs = {k: math.log10(v + 1) for k, v in theme_tvs.items()}
+    max_tv = max(tv_logs.values()) if tv_logs else 1
+    min_tv = min(tv_logs.values()) if tv_logs else 0
+    tv_range = max_tv - min_tv if max_tv != min_tv else 1
 
     combined_scores = {}
     for theme_name in valid_scores:
-        news_norm = valid_scores[theme_name] / max_news * 50
+        news_norm = valid_scores[theme_name] / max_news * 20
         avg_change = theme_changes.get(theme_name, 0)
-        change_norm = (avg_change - min_change) / change_range * 50
-        combined_scores[theme_name] = news_norm + change_norm
+        change_norm = (avg_change - min_change) / change_range * 40
+        tv_norm = (tv_logs[theme_name] - min_tv) / tv_range * 40 if theme_name in tv_logs else 0
+        combined_scores[theme_name] = news_norm + tv_norm + change_norm
 
     # 복합 점수순 정렬, 동점 시 종목 수
     sorted_themes = sorted(
@@ -1804,8 +1815,9 @@ def detect_themes_rule_based(news_titles, theme_map=None, krx_data=None):
             news_s = valid_scores.get(t["name"], 0)
             chg = theme_changes.get(t["name"], 0)
             combo = combined_scores.get(t["name"], 0)
+            tv_eok = theme_tvs.get(t["name"], 0) / 1e8
             names = ", ".join(s["name"] for s in t["stocks"][:3])
-            log(f"     - {t['name']} (뉴스 {news_s}건, 등락 {chg:+.2f}%, 점수 {combo:.1f}): {names}...")
+            log(f"     - {t['name']} (뉴스 {news_s}건, 거래대금 {tv_eok:,.0f}억, 등락 {chg:+.2f}%, 점수 {combo:.1f}): {names}...")
         return result
     else:
         log("  ⚠️ 규칙 기반 매칭 실패")
