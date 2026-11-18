@@ -1657,10 +1657,10 @@ function loadLwc(){
 const MT_IND=[
   {k:"ma5",label:"5일선",color:"#f43f5e"},{k:"ma10",label:"10일선",color:"#f59e0b"},{k:"ma20",label:"20일선",color:"#a855f7"},
   {k:"ma60",label:"60일선",color:"#22c55e"},{k:"ma120",label:"120일선",color:"#94a3b8"},
-  {k:"bb",label:"볼린저밴드",color:"#38bdf8"},{k:"rsi",label:"RSI",color:"#eab308",pane:true},
+  {k:"bb",label:"볼린저밴드",color:"#38bdf8"},{k:"env",label:"엔벨로프 20·20%",color:"#fb923c"},{k:"rsi",label:"RSI",color:"#eab308",pane:true},
   {k:"macd",label:"MACD",color:"#3b82f6",pane:true},{k:"stoch",label:"스토캐스틱",color:"#ec4899",pane:true},
 ];
-const MT_IND_DEF={ma10:true,ma20:true,ma60:true,bb:false,rsi:true,macd:true,stoch:false,ma5:false,ma120:false};
+const MT_IND_DEF={ma10:true,ma20:true,ma60:true,bb:false,env:false,rsi:true,macd:true,stoch:false,ma5:false,ma120:false};
 function mtIndLoad(){try{const v=JSON.parse(localStorage.getItem("sp-mt-ind")||"null");if(v&&typeof v==="object")return{...MT_IND_DEF,...v}}catch(e){}return{...MT_IND_DEF}}
 // 지표 계산 (값 배열, 앞부분은 null)
 const indSma=(a,n)=>a.map((_,i)=>{if(i<n-1)return null;let s=0;for(let k=i-n+1;k<=i;k++)s+=a[k];return s/n});
@@ -1723,6 +1723,8 @@ function MtLwc({lib,ind,theme,ohlcv,buyPrice,buyDate,sellDate,fills,steps}){
     vs.setData(rows.map((r,i)=>({time:T[i],value:V[i],color:(Cl[i]>=O[i]?up:dn)+"55"})));
     MT_IND.filter(x=>x.k.startsWith("ma")&&ind[x.k]).forEach(x=>line(mc,indSma(Cl,+x.k.slice(2)),x.color));
     if(ind.bb){const b=indBB(Cl);const c="#38bdf8";line(mc,b.map(x=>x&&x.up),c,1,{lineStyle:2});line(mc,b.map(x=>x&&x.mid),c,1);line(mc,b.map(x=>x&&x.lo),c,1,{lineStyle:2})}
+    if(ind.env){const m=indSma(Cl,20);const c="#fb923c";  // 엔벨로프: 20일선 ±20% (과대 낙폭 기준과 같음)
+      line(mc,m.map(v=>v==null?null:v*1.2),c,1,{lineStyle:2});if(!ind.ma20)line(mc,m,c,1,{lineStyle:1});line(mc,m.map(v=>v==null?null:v*0.8),c,1,{lineStyle:2})}
     const mk=[];const at=d=>T.find(t=>t>=d);
     const fl=fills&&fills.length?[...fills].sort(mtFillSort):null;
     const multiBuy=fl&&fl.filter(f=>f.side==="buy").length>1;
